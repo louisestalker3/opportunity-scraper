@@ -63,7 +63,12 @@
       "Bash(python -m alembic upgrade head)",
       "Bash(python -m alembic current)",
       "Bash(1 cat:*)",
-      "Bash(python -m alembic revision --autogenerate -m \"initial\")"
+      "Bash(python -m alembic revision --autogenerate -m \"initial\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\\\Users\\\\louis\\\\repos\\\\opportunity-scraper\\\\update.ps1\")",
+      "Bash(powershell -Command \"Stop-ScheduledTask ''OpportunityScraper-Backend''; Start-Sleep 2; Start-ScheduledTask ''OpportunityScraper-Backend''; Start-Sleep 3; \\(Get-ScheduledTask ''OpportunityScraper-Backend''\\).State\")",
+      "Bash(python -m alembic revision --autogenerate -m \"update\")",
+      "Bash(curl -s --max-time 5 \"http://127.0.0.1:9000/api/opportunities?min_score=0&sort_by=viability&page=1&page_size=1\")",
+      "Bash(curl -s --max-time 5 \"http://127.0.0.1:9000/api/pipeline\")"
     ]
   }
 }
