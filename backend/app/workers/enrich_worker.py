@@ -24,12 +24,16 @@ from app.scoring.viability import ViabilityScorer
 logger = logging.getLogger(__name__)
 
 
-def _run_async(coro):
-    loop = asyncio.new_event_loop()
+async def _run_with_cleanup(coro):
     try:
-        return loop.run_until_complete(coro)
+        return await coro
     finally:
-        loop.close()
+        from app.db.database import engine
+        await engine.dispose()
+
+
+def _run_async(coro):
+    return asyncio.run(_run_with_cleanup(coro))
 
 
 async def _get_or_create_app_profile(app_name: str) -> AppProfile:
@@ -79,9 +83,11 @@ async def _enrich_profile(app_profile_id: uuid.UUID) -> None:
         mentions = mention_result.scalars().all()
 
         # Also search by app name in app_names_mentioned JSON field
+        from sqlalchemy import cast, func
+        from sqlalchemy.dialects.postgresql import JSONB
         name_mention_result = await session.execute(
             select(Mention)
-            .where(Mention.app_names_mentioned.contains([profile.name]))
+            .where(cast(Mention.app_names_mentioned, JSONB).contains(cast([profile.name], JSONB)))
             .order_by(Mention.scraped_at.desc())
             .limit(200)
         )
@@ -194,15 +200,19 @@ async def _score_opportunity(app_profile_id: uuid.UUID) -> None:
         )
 
 
+async def _enrich_app_profile_async(app_name: str) -> str:
+    profile = await _get_or_create_app_profile(app_name)
+    await _enrich_profile(profile.id)
+    return str(profile.id)
+
+
 @celery_app.task(name="app.workers.enrich_worker.enrich_app_profile", bind=True, max_retries=3)
 def enrich_app_profile(self, app_name: str):
     """Fetch/create AppProfile, summarize mentions, then queue scoring."""
     logger.info("enrich_app_profile: Processing %r", app_name)
     try:
-        profile = _run_async(_get_or_create_app_profile(app_name))
-        _run_async(_enrich_profile(profile.id))
-        # Queue scoring
-        score_opportunity.delay(str(profile.id))
+        profile_id = _run_async(_enrich_app_profile_async(app_name))
+        score_opportunity.delay(profile_id)
     except Exception as exc:
         logger.error("enrich_app_profile failed for %r: %s", app_name, exc)
         raise self.retry(exc=exc, countdown=60 * 2)

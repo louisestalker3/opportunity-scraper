@@ -1,0 +1,51 @@
+{
+  "__app__": {
+    "api": 9000,
+    "frontend": 9001
+  },
+  "geeksguild": {
+    "frontend": 9002,
+    "api": 9003,
+    "db": 9004
+  },
+  "geeksguild-website": {
+    "frontend": 9005,
+    "api": 9006,
+    "db": 9007
+  },
+  "ideas": {
+    "frontend": 9008,
+    "api": 9009,
+    "db": 9010
+  },
+  "invoiceguild": {
+    "frontend": 9011,
+    "api": 9012,
+    "db": 9013
+  },
+  "jira-alternative": {
+    "frontend": 9014,
+    "api": 9015,
+    "db": 9016
+  },
+  "lemax-store": {
+    "frontend": 9017,
+    "api": 9018,
+    "db": 9019
+  },
+  "poke-scraper": {
+    "frontend": 9020,
+    "api": 9021,
+    "db": 9022
+  },
+  "project-forge": {
+    "frontend": 9023,
+    "api": 9024,
+    "db": 9025
+  },
+  "status-page": {
+    "frontend": 9026,
+    "api": 9027,
+    "db": 9028
+  }
+}

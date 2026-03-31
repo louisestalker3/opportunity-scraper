@@ -21,13 +21,17 @@ from app.nlp.entity_extraction import AppNameExtractor
 logger = logging.getLogger(__name__)
 
 
+async def _run_with_cleanup(coro):
+    try:
+        return await coro
+    finally:
+        from app.db.database import engine
+        await engine.dispose()
+
+
 def _run_async(coro):
     """Run an async coroutine from a sync Celery task."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+    return asyncio.run(_run_with_cleanup(coro))
 
 
 async def _process_raw_mentions(
@@ -101,14 +105,19 @@ def _queue_enrichment(app_names: list[str]) -> None:
         enrich_app_profile.delay(name)
 
 
+async def _scrape_and_process(scraper_cls, source: str):
+    scraper = scraper_cls()
+    raw = await scraper.scrape_with_retry()
+    new_apps = await _process_raw_mentions(raw, source)
+    return raw, new_apps
+
+
 @celery_app.task(name="app.workers.scrape_worker.scrape_reddit", bind=True, max_retries=3)
 def scrape_reddit(self):
     logger.info("Starting Reddit scrape task")
     try:
         from app.scrapers.reddit import RedditScraper
-        scraper = RedditScraper()
-        raw = _run_async(scraper.scrape_with_retry())
-        new_apps = _run_async(_process_raw_mentions(raw, "reddit"))
+        raw, new_apps = _run_async(_scrape_and_process(RedditScraper, "reddit"))
         _queue_enrichment(new_apps)
         logger.info("Reddit scrape done: %d items, %d new apps", len(raw), len(new_apps))
     except Exception as exc:
@@ -121,9 +130,7 @@ def scrape_hackernews(self):
     logger.info("Starting Hacker News scrape task")
     try:
         from app.scrapers.hackernews import HNScraper
-        scraper = HNScraper()
-        raw = _run_async(scraper.scrape_with_retry())
-        new_apps = _run_async(_process_raw_mentions(raw, "hackernews"))
+        raw, new_apps = _run_async(_scrape_and_process(HNScraper, "hackernews"))
         _queue_enrichment(new_apps)
         logger.info("HN scrape done: %d items, %d new apps", len(raw), len(new_apps))
     except Exception as exc:
@@ -136,9 +143,7 @@ def scrape_g2(self):
     logger.info("Starting G2 scrape task")
     try:
         from app.scrapers.g2 import G2Scraper
-        scraper = G2Scraper()
-        raw = _run_async(scraper.scrape_with_retry())
-        new_apps = _run_async(_process_raw_mentions(raw, "g2"))
+        raw, new_apps = _run_async(_scrape_and_process(G2Scraper, "g2"))
         _queue_enrichment(new_apps)
         logger.info("G2 scrape done: %d items, %d new apps", len(raw), len(new_apps))
     except Exception as exc:
@@ -151,9 +156,7 @@ def scrape_capterra(self):
     logger.info("Starting Capterra scrape task")
     try:
         from app.scrapers.capterra import CapterraScraper
-        scraper = CapterraScraper()
-        raw = _run_async(scraper.scrape_with_retry())
-        new_apps = _run_async(_process_raw_mentions(raw, "capterra"))
+        raw, new_apps = _run_async(_scrape_and_process(CapterraScraper, "capterra"))
         _queue_enrichment(new_apps)
         logger.info("Capterra scrape done: %d items, %d new apps", len(raw), len(new_apps))
     except Exception as exc:
@@ -166,9 +169,7 @@ def scrape_trustpilot(self):
     logger.info("Starting Trustpilot scrape task")
     try:
         from app.scrapers.trustpilot import TrustpilotScraper
-        scraper = TrustpilotScraper()
-        raw = _run_async(scraper.scrape_with_retry())
-        new_apps = _run_async(_process_raw_mentions(raw, "trustpilot"))
+        raw, new_apps = _run_async(_scrape_and_process(TrustpilotScraper, "trustpilot"))
         _queue_enrichment(new_apps)
         logger.info("Trustpilot scrape done: %d items, %d new apps", len(raw), len(new_apps))
     except Exception as exc:
@@ -181,9 +182,7 @@ def scrape_twitter(self):
     logger.info("Starting Twitter scrape task")
     try:
         from app.scrapers.twitter import TwitterScraper
-        scraper = TwitterScraper()
-        raw = _run_async(scraper.scrape_with_retry())
-        new_apps = _run_async(_process_raw_mentions(raw, "twitter"))
+        raw, new_apps = _run_async(_scrape_and_process(TwitterScraper, "twitter"))
         _queue_enrichment(new_apps)
         logger.info("Twitter scrape done: %d items, %d new apps", len(raw), len(new_apps))
     except Exception as exc:

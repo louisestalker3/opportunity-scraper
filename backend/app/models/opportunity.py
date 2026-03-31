@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
@@ -35,6 +35,12 @@ class Opportunity(Base):
     mention_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     complaint_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     alternative_seeking_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # AI-generated explanation of viability score (only set for ai_generated opportunities)
+    ai_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # User-assigned rank (1–5 stars, null = unranked)
+    user_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     last_scored: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

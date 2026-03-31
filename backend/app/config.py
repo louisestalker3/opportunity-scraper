@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,10 +17,10 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://localhost:6379/0"
 
-    # OpenAI
-    openai_api_key: str = ""
+    # Anthropic (Claude)
+    anthropic_api_key: str = ""
 
-    # Reddit
+    # Reddit (optional — uses public API if not set)
     reddit_client_id: str = ""
     reddit_client_secret: str = ""
     reddit_user_agent: str = "OpportunityScraper/1.0"
@@ -29,6 +31,9 @@ class Settings(BaseSettings):
     # App
     secret_key: str = "change-me-in-production"
     environment: str = "development"
+
+    # Local build output — parent folder where new project repos are created
+    repos_path: str = str(Path.home() / "repos")
 
     @property
     def is_development(self) -> bool:

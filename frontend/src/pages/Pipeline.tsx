@@ -1,10 +1,14 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { Trash2, ExternalLink, ChevronDown } from "lucide-react";
+import { Trash2, ExternalLink, ChevronDown, FileText, Hammer, CheckCircle2, AlertCircle, BookOpen, RefreshCw, Play, Square, Loader2 } from "lucide-react";
 import {
   usePipeline,
   useUpdatePipelineItem,
   useRemovePipelineItem,
+  useBuildApp,
+  useRegeneratePlan,
+  useStartProject,
+  useStopProject,
 } from "@/hooks/useOpportunities";
 import { useOpportunities } from "@/hooks/useOpportunities";
 import type { PipelineItem } from "@/api/client";
@@ -12,15 +16,86 @@ import type { PipelineItem } from "@/api/client";
 const COLUMNS: { id: PipelineItem["status"]; label: string; color: string }[] = [
   { id: "watching", label: "Watching", color: "border-blue-300 bg-blue-50" },
   { id: "considering", label: "Considering", color: "border-yellow-300 bg-yellow-50" },
-  { id: "building", label: "Building", color: "border-green-400 bg-green-50" },
+  { id: "building", label: "Building...", color: "border-blue-400 bg-blue-50" },
+  { id: "built", label: "Built", color: "border-green-500 bg-green-50" },
   { id: "dropped", label: "Dropped", color: "border-gray-300 bg-gray-100" },
 ];
+
+function ProposalPanel({ proposal }: { proposal: string }) {
+  // Render markdown headings and paragraphs simply without a full md library
+  const lines = proposal.split("\n");
+  return (
+    <div className="text-xs text-gray-700 space-y-2 max-h-96 overflow-y-auto pr-1">
+      {lines.map((line, i) => {
+        if (line.startsWith("## ")) return <h3 key={i} className="font-bold text-gray-900 text-sm mt-3 first:mt-0">{line.slice(3)}</h3>;
+        if (line.startsWith("### ")) return <h4 key={i} className="font-semibold text-gray-800 mt-2">{line.slice(4)}</h4>;
+        if (line.startsWith("- ")) return <p key={i} className="pl-3 before:content-['•'] before:mr-2 before:text-gray-400">{line.slice(2)}</p>;
+        if (line.startsWith("**") && line.endsWith("**")) return <p key={i} className="font-semibold">{line.slice(2, -2)}</p>;
+        if (line.trim() === "") return null;
+        return <p key={i} className="leading-relaxed">{line}</p>;
+      })}
+    </div>
+  );
+}
+
+function AppPlanPanel({ planJson }: { planJson: string }) {
+  try {
+    const plan = JSON.parse(planJson);
+    const mvp = plan.features?.filter((f: { priority: string }) => f.priority === "mvp") ?? [];
+    const v2 = plan.features?.filter((f: { priority: string }) => f.priority === "v2") ?? [];
+    return (
+      <div className="text-xs text-gray-700 space-y-3 max-h-96 overflow-y-auto pr-1">
+        {plan.tagline && <p className="italic text-gray-500">{plan.tagline}</p>}
+        {plan.description && <p className="leading-relaxed">{plan.description}</p>}
+        {plan.tech_stack && (
+          <div>
+            <p className="font-semibold text-gray-800 mb-1">Tech Stack</p>
+            <ul className="space-y-0.5">
+              {Object.entries(plan.tech_stack).map(([k, v]) => (
+                <li key={k}><span className="font-medium capitalize">{k}:</span> {String(v)}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {mvp.length > 0 && (
+          <div>
+            <p className="font-semibold text-gray-800 mb-1">MVP Features</p>
+            <ul className="space-y-0.5">
+              {mvp.map((f: { name: string; description: string }) => (
+                <li key={f.name}><span className="font-medium">{f.name}</span> — {f.description}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {v2.length > 0 && (
+          <div>
+            <p className="font-semibold text-gray-800 mb-1">v2 Features</p>
+            <ul className="space-y-0.5 text-gray-500">
+              {v2.map((f: { name: string; description: string }) => (
+                <li key={f.name}><span className="font-medium">{f.name}</span> — {f.description}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {plan.mvp_summary && <p className="text-gray-500 italic">{plan.mvp_summary}</p>}
+      </div>
+    );
+  } catch {
+    return <p className="text-xs text-gray-400">Could not parse app plan.</p>;
+  }
+}
 
 function PipelineCard({ item }: { item: PipelineItem }) {
   const updateMutation = useUpdatePipelineItem();
   const removeMutation = useRemovePipelineItem();
+  const buildMutation = useBuildApp();
+  const regenerateMutation = useRegeneratePlan();
+  const startMutation = useStartProject();
+  const stopMutation = useStopProject();
   const [editingNotes, setEditingNotes] = useState(false);
   const [notes, setNotes] = useState(item.notes ?? "");
+  const [showProposal, setShowProposal] = useState(false);
+  const [showPlan, setShowPlan] = useState(false);
 
   // Fetch opportunity details for display
   const { data: oppsData } = useOpportunities({ page_size: 100 });
@@ -68,8 +143,8 @@ function PipelineCard({ item }: { item: PipelineItem }) {
         <select
           value={item.status}
           onChange={(e) => handleStatusChange(e.target.value)}
-          disabled={updateMutation.isPending}
-          className="w-full text-xs border border-gray-200 rounded-lg px-2.5 py-1.5 bg-white appearance-none focus:outline-none focus:ring-2 focus:ring-green-500 pr-7"
+          disabled={updateMutation.isPending || item.build_status === "building"}
+          className="w-full text-xs border border-gray-200 rounded-lg px-2.5 py-1.5 bg-white appearance-none focus:outline-none focus:ring-2 focus:ring-green-500 pr-7 disabled:opacity-50"
         >
           {COLUMNS.map((col) => (
             <option key={col.id} value={col.id}>
@@ -118,6 +193,141 @@ function PipelineCard({ item }: { item: PipelineItem }) {
         </button>
       )}
 
+      {/* Proposal toggle */}
+      {item.proposal && (
+        <div className="border-t border-gray-100 pt-2">
+          <button
+            onClick={() => setShowProposal((v) => !v)}
+            className="flex items-center gap-1.5 text-xs font-medium text-indigo-600 hover:text-indigo-800 transition-colors w-full"
+          >
+            <FileText size={12} />
+            {showProposal ? "Hide proposal" : "View proposal"}
+            <ChevronDown size={11} className={`ml-auto transition-transform ${showProposal ? "rotate-180" : ""}`} />
+          </button>
+          {showProposal && (
+            <div className="mt-3 bg-gray-50 border border-gray-200 rounded-lg p-3">
+              <ProposalPanel proposal={item.proposal} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* App plan toggle */}
+      {item.app_plan && (
+        <div className="border-t border-gray-100 pt-2">
+          <button
+            onClick={() => setShowPlan((v) => !v)}
+            className="flex items-center gap-1.5 text-xs font-medium text-emerald-600 hover:text-emerald-800 transition-colors w-full"
+          >
+            <BookOpen size={12} />
+            {showPlan ? "Hide app plan" : "View app plan"}
+            <ChevronDown size={11} className={`ml-auto transition-transform ${showPlan ? "rotate-180" : ""}`} />
+          </button>
+          {showPlan && (
+            <div className="mt-3 bg-gray-50 border border-gray-200 rounded-lg p-3">
+              <AppPlanPanel planJson={item.app_plan} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Build button */}
+      {item.app_plan && (
+        <div className="border-t border-gray-100 pt-2">
+          {item.build_status === "built" ? (
+            <div className="flex items-center gap-1.5 text-xs font-semibold text-green-700">
+              <CheckCircle2 size={13} />
+              Built
+              {item.built_repo_url && (
+                <a href={item.built_repo_url} target="_blank" rel="noopener noreferrer" className="ml-auto text-green-600 hover:underline flex items-center gap-1">
+                  GitHub <ExternalLink size={11} />
+                </a>
+              )}
+            </div>
+          ) : item.build_status === "building" ? (
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-blue-600 animate-pulse">
+                <Hammer size={13} />
+                Building...
+              </div>
+              {item.build_log && (
+                <div className="bg-gray-900 rounded-lg px-2.5 py-2 text-xs font-mono text-green-400 leading-relaxed max-h-28 overflow-y-auto">
+                  {item.build_log.split("\n").map((line, i) => (
+                    <div key={i}>{line}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : item.build_status === "failed" ? (
+            <button
+              onClick={() => buildMutation.mutate(item.id)}
+              disabled={buildMutation.isPending}
+              className="flex items-center gap-1.5 text-xs font-medium text-red-600 hover:text-red-800 w-full"
+            >
+              <AlertCircle size={12} />
+              Build failed — retry
+            </button>
+          ) : (
+            <button
+              onClick={() => buildMutation.mutate(item.id)}
+              disabled={buildMutation.isPending}
+              className="w-full flex items-center justify-center gap-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-3 py-2 transition-colors disabled:opacity-50"
+            >
+              <Hammer size={12} />
+              Build This App
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Run controls — only show once built */}
+      {item.build_status === "built" && (
+        <div className="border-t border-gray-100 pt-2">
+          {item.run_status === "running" ? (
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-2">
+                <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-600">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  Running
+                </span>
+                {item.run_url && (
+                  <a href={item.run_url} target="_blank" rel="noopener noreferrer" className="ml-auto text-xs text-emerald-600 hover:underline flex items-center gap-1">
+                    Open <ExternalLink size={11} />
+                  </a>
+                )}
+              </div>
+              <button
+                onClick={() => stopMutation.mutate(item.id)}
+                disabled={stopMutation.isPending}
+                className="w-full flex items-center justify-center gap-1.5 text-xs font-semibold bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50"
+              >
+                <Square size={11} />
+                Stop
+              </button>
+            </div>
+          ) : item.run_status === "starting" ? (
+            <div className="flex items-center gap-1.5 text-xs text-blue-600 animate-pulse">
+              <Loader2 size={12} className="animate-spin" />
+              Starting...
+            </div>
+          ) : item.run_status === "stopping" ? (
+            <div className="flex items-center gap-1.5 text-xs text-gray-500 animate-pulse">
+              <Loader2 size={12} className="animate-spin" />
+              Stopping...
+            </div>
+          ) : (
+            <button
+              onClick={() => startMutation.mutate(item.id)}
+              disabled={startMutation.isPending}
+              className="w-full flex items-center justify-center gap-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50"
+            >
+              <Play size={11} />
+              Start App
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Footer actions */}
       <div className="flex items-center justify-between pt-1 border-t border-gray-100">
         <Link
@@ -126,14 +336,24 @@ function PipelineCard({ item }: { item: PipelineItem }) {
         >
           View <ExternalLink size={11} />
         </Link>
-        <button
-          onClick={() => removeMutation.mutate(item.id)}
-          disabled={removeMutation.isPending}
-          className="text-gray-300 hover:text-red-400 transition-colors disabled:opacity-40"
-          title="Remove from pipeline"
-        >
-          <Trash2 size={13} />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => regenerateMutation.mutate(item.id)}
+            disabled={regenerateMutation.isPending}
+            className="text-gray-300 hover:text-blue-400 transition-colors disabled:opacity-40"
+            title="Regenerate plan & proposal"
+          >
+            <RefreshCw size={12} className={regenerateMutation.isPending ? "animate-spin" : ""} />
+          </button>
+          <button
+            onClick={() => removeMutation.mutate(item.id)}
+            disabled={removeMutation.isPending}
+            className="text-gray-300 hover:text-red-400 transition-colors disabled:opacity-40"
+            title="Remove from pipeline"
+          >
+            <Trash2 size={13} />
+          </button>
+        </div>
       </div>
     </div>
   );

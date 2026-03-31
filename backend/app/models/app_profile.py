@@ -32,6 +32,9 @@ class AppProfile(Base):
     # List of UUID strings referencing other AppProfile ids
     competitor_ids: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
+    # scraped | ai_generated
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="scraped", index=True)
+
     first_seen: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )

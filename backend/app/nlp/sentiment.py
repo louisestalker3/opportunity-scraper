@@ -1,98 +1,122 @@
-import json
+"""
+Sentiment analysis using Claude (if ANTHROPIC_API_KEY is set) with VADER as fallback.
+"""
 import logging
 from typing import Any
 
-from openai import AsyncOpenAI
-
-from app.config import settings
+from app.nlp.claude_cli import call_claude_json
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a market intelligence analyst specialising in SaaS and software products.
+BATCH_SIZE = 10
 
-Your job is to classify user-generated text (Reddit posts, reviews, tweets, forum comments) about software tools.
+SYSTEM_PROMPT = """You are a market intelligence analyst specialising in SaaS products.
 
-For each piece of text, return a JSON object with these fields:
+Classify each piece of user-generated text (Reddit posts, reviews, forum comments) about software tools.
+
+For each text, return a JSON object with:
 - sentiment: "positive" | "negative" | "neutral"
-  * positive = user is happy/satisfied with a product or feature
-  * negative = user is unhappy, complaining, or frustrated
-  * neutral = factual, informational, or mixed
 - signal_type: "complaint" | "praise" | "alternative_seeking" | "pricing_objection" | "general"
-  * complaint = specific pain point or bug report
+  * complaint = specific pain point or frustration
   * praise = complimenting a feature or product
   * alternative_seeking = user is looking for a different/better tool
-  * pricing_objection = user complains about cost or pricing model
-  * general = doesn't fit the above categories
-- confidence_score: float between 0.0 and 1.0 representing your certainty
+  * pricing_objection = user complains explicitly about cost or pricing
+  * general = informational or doesn't fit above
+- confidence_score: float 0.0–1.0
 
-Be conservative: only mark alternative_seeking if there is clear intent to switch or find another tool.
-Only mark pricing_objection if pricing is the explicit or primary concern.
-
-Respond ONLY with a JSON array, one object per input text."""
-
-BATCH_SIZE = 10
+Respond ONLY with a JSON array, one object per input text, in the same order."""
 
 
 class SentimentAnalyser:
     def __init__(self) -> None:
-        self.client = AsyncOpenAI(api_key=settings.openai_api_key)
+        self._vader = None
+        try:
+            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+            self._vader = SentimentIntensityAnalyzer()
+        except ImportError:
+            logger.warning("SentimentAnalyser: vaderSentiment not installed — using keyword fallback")
+
+    # ── Claude-based analysis ────────────────────────────────────────────────
+
+    async def _analyse_with_claude(self, texts: list[str]) -> list[dict[str, Any]]:
+        numbered = "\n\n".join(f"[{i + 1}] {t[:800]}" for i, t in enumerate(texts))
+
+        parsed = await call_claude_json(numbered, system=SYSTEM_PROMPT)
+        if not parsed:
+            return [{"sentiment": "neutral", "signal_type": "general", "confidence_score": 0.0} for _ in texts]
+
+        if not isinstance(parsed, list):
+            parsed = list(parsed.values())[0] if isinstance(parsed, dict) else []
+
+        out = []
+        for i, _ in enumerate(texts):
+            item = parsed[i] if i < len(parsed) and isinstance(parsed[i], dict) else {}
+            out.append({
+                "sentiment": item.get("sentiment", "neutral"),
+                "signal_type": item.get("signal_type", "general"),
+                "confidence_score": float(item.get("confidence_score", 0.5)),
+            })
+        return out
+
+    # ── VADER / keyword fallback ─────────────────────────────────────────────
+
+    _COMPLAINT_KW = ["broken", "bug", "issue", "problem", "frustrat", "hate", "terrible",
+                     "awful", "slow", "crash", "useless", "disappoint", "annoying", "worst",
+                     "doesn't work", "not work", "stopped working"]
+    _ALTERNATIVE_KW = ["alternative to", "alternatives to", "looking for", "recommend",
+                       "switched from", "switch from", "moving away", "replace", "instead of"]
+    _PRICING_KW = ["too expensive", "overpriced", "pricing", "cost", "afford",
+                   "subscription fee", "price hike", "can't afford", "cheaper"]
+    _PRAISE_KW = ["love", "great", "amazing", "excellent", "perfect", "awesome",
+                  "fantastic", "best", "recommend", "happy with", "works great"]
+
+    def _classify_local(self, text: str) -> dict[str, Any]:
+        lower = text.lower()
+
+        signal_type = "general"
+        if any(k in lower for k in self._ALTERNATIVE_KW):
+            signal_type = "alternative_seeking"
+        elif any(k in lower for k in self._PRICING_KW):
+            signal_type = "pricing_objection"
+        elif any(k in lower for k in self._COMPLAINT_KW):
+            signal_type = "complaint"
+        elif any(k in lower for k in self._PRAISE_KW):
+            signal_type = "praise"
+
+        if self._vader:
+            scores = self._vader.polarity_scores(text)
+            compound = scores["compound"]
+            sentiment = "positive" if compound >= 0.05 else "negative" if compound <= -0.05 else "neutral"
+            confidence = round(min(abs(compound) + 0.5, 1.0), 3)
+        else:
+            pos = sum(1 for k in self._PRAISE_KW if k in lower)
+            neg = sum(1 for k in self._COMPLAINT_KW if k in lower)
+            if pos > neg:
+                sentiment, confidence = "positive", 0.6
+            elif neg > pos:
+                sentiment, confidence = "negative", 0.6
+            else:
+                sentiment, confidence = "neutral", 0.5
+
+        # Complaints shouldn't be positive
+        if signal_type in ("complaint", "pricing_objection", "alternative_seeking") and sentiment == "positive":
+            sentiment = "neutral"
+
+        return {"sentiment": sentiment, "signal_type": signal_type, "confidence_score": confidence}
+
+    # ── Public interface ─────────────────────────────────────────────────────
 
     async def analyse_batch(self, texts: list[str]) -> list[dict[str, Any]]:
-        """Analyse a batch of texts (up to BATCH_SIZE). Returns list of classification dicts."""
         if not texts:
             return []
-
-        numbered = "\n\n".join(
-            f"[{i + 1}] {text[:1000]}" for i, text in enumerate(texts)
-        )
-
-        try:
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": numbered},
-                ],
-                temperature=0.1,
-                response_format={"type": "json_object"},
-            )
-            raw = response.choices[0].message.content or "{}"
-            parsed = json.loads(raw)
-
-            # The model may return {"results": [...]} or just [...]
-            if isinstance(parsed, list):
-                results = parsed
-            elif isinstance(parsed, dict):
-                results = parsed.get("results", list(parsed.values())[0] if parsed else [])
-            else:
-                results = []
-
-            # Ensure we have one result per input
-            out = []
-            for i, text in enumerate(texts):
-                if i < len(results) and isinstance(results[i], dict):
-                    item = results[i]
-                else:
-                    item = {}
-                out.append({
-                    "sentiment": item.get("sentiment", "neutral"),
-                    "signal_type": item.get("signal_type", "general"),
-                    "confidence_score": float(item.get("confidence_score", 0.5)),
-                })
-            return out
-
-        except Exception as exc:
-            logger.error("Sentiment analysis failed: %s", exc)
-            return [
-                {"sentiment": "neutral", "signal_type": "general", "confidence_score": 0.0}
-                for _ in texts
-            ]
+        result = await self._analyse_with_claude(texts)
+        if result and any(r.get("confidence_score", 0) > 0 for r in result):
+            return result
+        return [self._classify_local(t) for t in texts]
 
     async def analyse_many(self, texts: list[str]) -> list[dict[str, Any]]:
-        """Analyse an arbitrary number of texts in batches of BATCH_SIZE."""
         results: list[dict[str, Any]] = []
         for i in range(0, len(texts), BATCH_SIZE):
             batch = texts[i: i + BATCH_SIZE]
-            batch_results = await self.analyse_batch(batch)
-            results.extend(batch_results)
+            results.extend(await self.analyse_batch(batch))
         return results

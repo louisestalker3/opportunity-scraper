@@ -7,6 +7,10 @@ import App from "./App";
 import Dashboard from "./pages/Dashboard";
 import OpportunityDetail from "./pages/OpportunityDetail";
 import Pipeline from "./pages/Pipeline";
+import Projects from "./pages/Projects";
+import ProjectDetail from "./pages/ProjectDetail";
+import CloneAnalysis from "./pages/CloneAnalysis";
+import Settings from "./pages/Settings";
 
 import "./index.css";
 
@@ -27,6 +31,10 @@ const router = createBrowserRouter([
       { index: true, element: <Dashboard /> },
       { path: "opportunity/:id", element: <OpportunityDetail /> },
       { path: "pipeline", element: <Pipeline /> },
+      { path: "projects", element: <Projects /> },
+      { path: "project/:id", element: <ProjectDetail /> },
+      { path: "analyze", element: <CloneAnalysis /> },
+      { path: "settings", element: <Settings /> },
     ],
   },
 ]);

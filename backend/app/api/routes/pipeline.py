@@ -1,19 +1,31 @@
+import asyncio
+import json
+import os
+import re
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
+from app.config import settings
 from app.db.database import get_db
+from app.models.app_profile import AppProfile
 from app.models.opportunity import Opportunity
 from app.models.pipeline_item import PipelineItem
+from app.nlp.app_plan_generator import generate_app_plan
+from app.nlp.proposal_generator import generate_proposal
+
+# File shared with build_runner.py — stores active session IDs so the runner
+# can poll the right pipeline items. Lives next to build_runner.py in the repo root.
+_SESSIONS_FILE = Path(__file__).resolve().parents[4] / ".build_sessions"
 
 router = APIRouter()
 
-VALID_STATUSES = {"watching", "considering", "building", "dropped"}
+VALID_STATUSES = {"watching", "considering", "building", "built", "dropped"}
 
 
 # ─── Schemas ─────────────────────────────────────────────────────────────────
@@ -23,7 +35,17 @@ class PipelineItemResponse(BaseModel):
     opportunity_id: uuid.UUID
     user_session_id: str
     notes: str | None
+    proposal: str | None
+    app_plan: str | None
     status: str
+    build_status: str | None
+    built_repo_url: str | None
+    build_log: str | None
+    run_status: str | None
+    run_url: str | None
+    chosen_name: str | None = None
+    chosen_logo_svg: str | None = None
+    chosen_logo_colors: dict | None = None
     created_at: Any
     updated_at: Any
 
@@ -46,10 +68,7 @@ class UpdatePipelineItemRequest(BaseModel):
 
 def get_session_id(x_session_id: str | None = Header(default=None)) -> str:
     if not x_session_id:
-        raise HTTPException(
-            status_code=400,
-            detail="X-Session-ID header is required",
-        )
+        raise HTTPException(status_code=400, detail="X-Session-ID header is required")
     return x_session_id
 
 
@@ -60,10 +79,12 @@ async def list_pipeline(
     session_id: str = Depends(get_session_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all pipeline items for the current session."""
     result = await db.execute(
         select(PipelineItem)
-        .where(PipelineItem.user_session_id == session_id)
+        .where(
+            (PipelineItem.user_session_id == session_id)
+            | (PipelineItem.user_session_id == "imported")
+        )
         .order_by(PipelineItem.created_at.desc())
     )
     items = result.scalars().all()
@@ -76,11 +97,9 @@ async def add_to_pipeline(
     session_id: str = Depends(get_session_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """Add an opportunity to the pipeline."""
     if body.status not in VALID_STATUSES:
-        raise HTTPException(status_code=422, detail=f"Invalid status. Must be one of: {VALID_STATUSES}")
+        raise HTTPException(status_code=422, detail=f"Invalid status: {VALID_STATUSES}")
 
-    # Verify opportunity exists
     opp_result = await db.execute(
         select(Opportunity).where(Opportunity.id == body.opportunity_id)
     )
@@ -88,15 +107,22 @@ async def add_to_pipeline(
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
 
-    # Check for duplicate
     existing = await db.execute(
         select(PipelineItem).where(
-            PipelineItem.user_session_id == session_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
             PipelineItem.opportunity_id == body.opportunity_id,
         )
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Opportunity already in pipeline")
+
+    profile_result = await db.execute(
+        select(AppProfile).where(AppProfile.id == opp.app_profile_id)
+    )
+    profile = profile_result.scalar_one_or_none()
+
+    # Generate proposal and app plan in parallel
+    proposal, app_plan = await _generate_proposal_and_plan(opp, profile)
 
     item = PipelineItem(
         id=uuid.uuid4(),
@@ -104,8 +130,416 @@ async def add_to_pipeline(
         user_session_id=session_id,
         notes=body.notes,
         status=body.status,
+        proposal=proposal,
+        app_plan=app_plan,
     )
     db.add(item)
+    await db.commit()
+    await db.refresh(item)
+    return PipelineItemResponse.model_validate(item)
+
+
+@router.post("/{item_id}/regenerate", response_model=PipelineItemResponse)
+async def regenerate_plan_and_proposal(
+    item_id: uuid.UUID,
+    session_id: str = Depends(get_session_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-generate the proposal and app plan from scratch, resetting build state."""
+    result = await db.execute(
+        select(PipelineItem).where(
+            PipelineItem.id == item_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pipeline item not found")
+
+    opp_result = await db.execute(
+        select(Opportunity).where(Opportunity.id == item.opportunity_id)
+    )
+    opp = opp_result.scalar_one_or_none()
+    if not opp:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+
+    profile_result = await db.execute(
+        select(AppProfile).where(AppProfile.id == opp.app_profile_id)
+    )
+    profile = profile_result.scalar_one_or_none()
+
+    proposal, app_plan = await _generate_proposal_and_plan(opp, profile)
+
+    item.proposal = proposal
+    item.app_plan = app_plan
+    item.build_status = None
+    item.built_repo_url = None
+
+    await db.commit()
+    await db.refresh(item)
+    return PipelineItemResponse.model_validate(item)
+
+
+@router.post("/{item_id}/build", status_code=202)
+async def trigger_build(
+    item_id: uuid.UUID,
+    session_id: str = Depends(get_session_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark item as building — the local build_runner.py picks it up and does the work."""
+    result = await db.execute(
+        select(PipelineItem).where(
+            PipelineItem.id == item_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pipeline item not found")
+    if not item.app_plan:
+        raise HTTPException(status_code=422, detail="No app plan — save the opportunity first")
+    if item.build_status == "building":
+        raise HTTPException(status_code=409, detail="Build already in progress")
+    if item.build_status == "built":
+        raise HTTPException(status_code=409, detail="Already built")
+
+    item.build_status = "building"
+    item.status = "building"
+    item.build_log = None
+    await db.commit()
+
+    # Record session ID so build_runner.py (running on the host) can poll the pipeline
+    try:
+        _SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        existing = set(_SESSIONS_FILE.read_text().splitlines()) if _SESSIONS_FILE.exists() else set()
+        existing.add(session_id)
+        _SESSIONS_FILE.write_text("\n".join(existing) + "\n")
+    except Exception:
+        pass
+
+    return {"status": "building", "item_id": str(item_id)}
+
+
+class BuildLogRequest(BaseModel):
+    message: str
+
+
+@router.post("/{item_id}/build-log", status_code=204)
+async def append_build_log(
+    item_id: uuid.UUID,
+    body: BuildLogRequest,
+    session_id: str = Depends(get_session_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Append a progress line to the build log. Called by build_runner.py."""
+    result = await db.execute(
+        select(PipelineItem).where(
+            PipelineItem.id == item_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pipeline item not found")
+
+    existing = item.build_log or ""
+    item.build_log = existing + body.message + "\n"
+    await db.commit()
+
+
+class BuildResultRequest(BaseModel):
+    build_status: str  # "built" or "failed"
+    built_repo_url: str | None = None
+
+
+@router.post("/{item_id}/build-result", response_model=PipelineItemResponse)
+async def set_build_result(
+    item_id: uuid.UUID,
+    body: BuildResultRequest,
+    session_id: str = Depends(get_session_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Called by the host-side build_runner.py to record the build outcome."""
+    result = await db.execute(
+        select(PipelineItem).where(
+            PipelineItem.id == item_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pipeline item not found")
+
+    item.build_status = body.build_status
+    if body.build_status == "built":
+        item.status = "built"
+        if body.built_repo_url:
+            item.built_repo_url = body.built_repo_url
+    elif body.build_status == "failed":
+        item.status = "considering"  # move back so it's not stuck in "building"
+    await db.commit()
+    await db.refresh(item)
+    return PipelineItemResponse.model_validate(item)
+
+
+_PORT_REGISTRY_FILE = Path(__file__).resolve().parents[4] / ".port_registry.json"
+
+
+def _read_port_registry() -> dict:
+    try:
+        if _PORT_REGISTRY_FILE.exists():
+            return json.loads(_PORT_REGISTRY_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+@router.get("/{item_id}/ports")
+async def get_project_ports(
+    item_id: uuid.UUID,
+    session_id: str = Depends(get_session_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the registry-allocated ports for a project."""
+    result = await db.execute(
+        select(PipelineItem).where(
+            PipelineItem.id == item_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pipeline item not found")
+
+    try:
+        plan = json.loads(item.app_plan or "{}")
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid app plan")
+
+    slug = re.sub(r"[^a-z0-9\-]", "", plan.get("slug", "")).lower()
+    registry = _read_port_registry()
+    port_entry = registry.get(slug, {})
+    # Format as {service: [{host, container}]} to keep the existing client interface
+    ports = {k: [{"host": v, "container": v}] for k, v in port_entry.items()}
+    return {"slug": slug, "ports": ports}
+
+
+@router.get("/{item_id}/services")
+async def get_project_services(
+    item_id: uuid.UUID,
+    session_id: str = Depends(get_session_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return service names and allocated ports for a project from the registry."""
+    result = await db.execute(
+        select(PipelineItem).where(
+            PipelineItem.id == item_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pipeline item not found")
+
+    try:
+        plan = json.loads(item.app_plan or "{}")
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid app plan")
+
+    slug = re.sub(r"[^a-z0-9\-]", "", plan.get("slug", "")).lower()
+    registry = _read_port_registry()
+    port_entry = registry.get(slug, {})
+
+    return {
+        "slug": slug,
+        "services": [
+            {"name": svc, "ports": [{"host": port, "container": port}]}
+            for svc, port in port_entry.items()
+        ],
+    }
+
+
+@router.get("/{item_id}/logs/{service}")
+async def get_service_logs(
+    item_id: uuid.UUID,
+    service: str,
+    tail: int = 200,
+    session_id: str = Depends(get_session_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return recent log lines from the project's .logs/{service}.log file."""
+    result = await db.execute(
+        select(PipelineItem).where(
+            PipelineItem.id == item_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pipeline item not found")
+
+    if not re.match(r'^[a-zA-Z0-9_-]+$', service):
+        raise HTTPException(status_code=422, detail="Invalid service name")
+
+    try:
+        plan = json.loads(item.app_plan or "{}")
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid app plan")
+
+    slug = re.sub(r"[^a-z0-9\-]", "", plan.get("slug", "")).lower()
+    log_file = Path(settings.repos_path) / slug / ".logs" / f"{service}.log"
+
+    if not log_file.exists():
+        return {"service": service, "lines": [f"[no log file at {log_file}]"]}
+
+    try:
+        all_lines = log_file.read_text(errors="replace").splitlines()
+        lines = all_lines[-tail:] if len(all_lines) > tail else all_lines
+    except Exception as e:
+        lines = [f"[error reading log: {e}]"]
+
+    return {"service": service, "lines": lines}
+
+
+@router.post("/{item_id}/force-stop", status_code=202)
+async def force_stop_project(
+    item_id: uuid.UUID,
+    session_id: str = Depends(get_session_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Kill all PIDs in the project's .pids/ directory."""
+    result = await db.execute(
+        select(PipelineItem).where(
+            PipelineItem.id == item_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pipeline item not found")
+
+    try:
+        plan = json.loads(item.app_plan or "{}")
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid app plan")
+
+    slug = re.sub(r"[^a-z0-9\-]", "", plan.get("slug", "")).lower()
+    pids_dir = Path(settings.repos_path) / slug / ".pids"
+
+    if pids_dir.exists():
+        import signal as _signal
+        for pid_file in pids_dir.glob("*.pid"):
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, _signal.SIGKILL)
+            except Exception:
+                pass
+
+    item.run_status = "stopped"
+    item.run_url = None
+    await db.commit()
+    return {"status": "stopped", "item_id": str(item_id)}
+
+
+def _parse_compose_services(compose_text: str) -> list[str]:
+    """Legacy helper kept for any existing callers."""
+    services = []
+    in_services_block = False
+    for line in compose_text.splitlines():
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if line.strip() == "services:":
+            in_services_block = True
+            continue
+        if in_services_block:
+            if indent == 0 and stripped and not stripped.startswith("#"):
+                break  # left services block
+            if indent == 2 and stripped and not stripped.startswith("#") and stripped.endswith(":"):
+                svc = stripped.rstrip(":")
+                if svc not in ("volumes", "networks"):
+                    services.append(svc)
+    return services
+
+
+@router.post("/{item_id}/start", status_code=202)
+async def start_project(
+    item_id: uuid.UUID,
+    session_id: str = Depends(get_session_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark item as starting — build_runner.py runs docker compose up -d."""
+    result = await db.execute(
+        select(PipelineItem).where(
+            PipelineItem.id == item_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pipeline item not found")
+    if item.build_status != "built":
+        raise HTTPException(status_code=422, detail="App must be built before it can be started")
+    if item.run_status in ("starting", "running"):
+        raise HTTPException(status_code=409, detail="Already running or starting")
+
+    item.run_status = "starting"
+    item.run_url = None
+    await db.commit()
+    return {"status": "starting", "item_id": str(item_id)}
+
+
+@router.post("/{item_id}/stop", status_code=202)
+async def stop_project(
+    item_id: uuid.UUID,
+    session_id: str = Depends(get_session_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark item as stopping — build_runner.py runs docker compose down."""
+    result = await db.execute(
+        select(PipelineItem).where(
+            PipelineItem.id == item_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pipeline item not found")
+    if item.run_status not in ("running", "starting"):
+        raise HTTPException(status_code=409, detail="Not currently running")
+
+    item.run_status = "stopping"
+    await db.commit()
+    return {"status": "stopping", "item_id": str(item_id)}
+
+
+class RunResultRequest(BaseModel):
+    run_status: str  # "running" | "stopped" | "failed"
+    run_url: str | None = None
+
+
+@router.post("/{item_id}/run-result", response_model=PipelineItemResponse)
+async def set_run_result(
+    item_id: uuid.UUID,
+    body: RunResultRequest,
+    session_id: str = Depends(get_session_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Called by the host-side build_runner.py to record the run outcome."""
+    result = await db.execute(
+        select(PipelineItem).where(
+            PipelineItem.id == item_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
+        )
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pipeline item not found")
+
+    item.run_status = body.run_status
+    if body.run_url:
+        item.run_url = body.run_url
+    elif body.run_status in ("stopped", "failed"):
+        item.run_url = None
     await db.commit()
     await db.refresh(item)
     return PipelineItemResponse.model_validate(item)
@@ -118,11 +552,10 @@ async def update_pipeline_item(
     session_id: str = Depends(get_session_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update status or notes for a pipeline item."""
     result = await db.execute(
         select(PipelineItem).where(
             PipelineItem.id == item_id,
-            PipelineItem.user_session_id == session_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
         )
     )
     item = result.scalar_one_or_none()
@@ -131,7 +564,7 @@ async def update_pipeline_item(
 
     if body.status is not None:
         if body.status not in VALID_STATUSES:
-            raise HTTPException(status_code=422, detail=f"Invalid status. Must be one of: {VALID_STATUSES}")
+            raise HTTPException(status_code=422, detail=f"Invalid status: {VALID_STATUSES}")
         item.status = body.status
 
     if body.notes is not None:
@@ -148,11 +581,10 @@ async def remove_from_pipeline(
     session_id: str = Depends(get_session_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """Remove an item from the pipeline."""
     result = await db.execute(
         select(PipelineItem).where(
             PipelineItem.id == item_id,
-            PipelineItem.user_session_id == session_id,
+            ((PipelineItem.user_session_id == session_id) | (PipelineItem.user_session_id == "imported")),
         )
     )
     item = result.scalar_one_or_none()
@@ -161,3 +593,34 @@ async def remove_from_pipeline(
 
     await db.delete(item)
     await db.commit()
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+async def _generate_proposal_and_plan(opp: Opportunity, profile: AppProfile | None):
+    import asyncio
+    proposal_coro = generate_proposal(
+        app_name=profile.name if profile else "Unknown",
+        category=profile.category if profile else None,
+        description=profile.description if profile else None,
+        pros=profile.pros if profile else [],
+        cons=profile.cons if profile else [],
+        pricing_tiers=profile.pricing_tiers if profile else [],
+        target_audience=profile.target_audience if profile else None,
+        viability_score=opp.viability_score,
+        complaint_severity=opp.complaint_severity_score,
+        mention_count=opp.mention_count,
+        alternative_seeking_count=opp.alternative_seeking_count,
+    )
+    plan_coro = generate_app_plan(
+        app_name=profile.name if profile else "Unknown",
+        category=profile.category if profile else None,
+        description=profile.description if profile else None,
+        pros=profile.pros if profile else [],
+        cons=profile.cons if profile else [],
+        target_audience=profile.target_audience if profile else None,
+        viability_score=opp.viability_score,
+        mention_count=opp.mention_count,
+        alternative_seeking_count=opp.alternative_seeking_count,
+    )
+    return await asyncio.gather(proposal_coro, plan_coro)

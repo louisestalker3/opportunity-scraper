@@ -10,6 +10,7 @@ celery_app = Celery(
     include=[
         "app.workers.scrape_worker",
         "app.workers.enrich_worker",
+        "app.workers.heartbeat_worker",
     ],
 )
 
@@ -60,5 +61,10 @@ celery_app.conf.beat_schedule = {
     "enrich-new-apps": {
         "task": "app.workers.enrich_worker.enrich_pending_apps",
         "schedule": crontab(minute=0, hour="*"),
+    },
+    # Heartbeat — lets the UI show the celery worker as alive
+    "celery-heartbeat": {
+        "task": "app.workers.heartbeat_worker.send_heartbeat",
+        "schedule": 10.0,  # every 10 seconds
     },
 }

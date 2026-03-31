@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import opportunities, apps, pipeline
+from app.api.routes import opportunities, apps, pipeline, scrape, analyze, ideas, names, logos, tasks, status, settings as settings_routes
 from app.config import settings
 
 logging.basicConfig(level=logging.INFO)
@@ -24,7 +24,7 @@ origins = ["*"] if settings.is_development else [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -43,3 +43,14 @@ async def health_check() -> dict:
 app.include_router(opportunities.router, prefix="/api/opportunities", tags=["opportunities"])
 app.include_router(apps.router, prefix="/api/apps", tags=["apps"])
 app.include_router(pipeline.router, prefix="/api/pipeline", tags=["pipeline"])
+app.include_router(scrape.router, prefix="/api/scrape", tags=["scrape"])
+app.include_router(analyze.router, prefix="/api/analyze", tags=["analyze"])
+app.include_router(ideas.router, prefix="/api/ideas", tags=["ideas"])
+
+# Per-project sub-resources (nested under pipeline items)
+app.include_router(names.router, prefix="/api/pipeline/{item_id}/names", tags=["names"])
+app.include_router(logos.router, prefix="/api/pipeline/{item_id}/logos", tags=["logos"])
+app.include_router(tasks.router, prefix="/api/pipeline/{item_id}/tasks", tags=["tasks"])
+app.include_router(tasks.runner_router, prefix="/api/tasks", tags=["task-runner"])
+app.include_router(status.router, prefix="/api/status", tags=["status"])
+app.include_router(settings_routes.router, prefix="/api/settings", tags=["settings"])
