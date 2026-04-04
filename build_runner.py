@@ -16,12 +16,72 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 API_BASE = os.environ.get("API_BASE", "http://localhost:9000")
 REPOS_PATH = Path(os.environ.get("REPOS_PATH", Path.home() / "repos"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "claude"
 POLL_INTERVAL = 4
+
+
+def _local_ip() -> str:
+    """Return the machine's LAN IP (e.g. 192.168.x.x)."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "localhost"
+
+
+LOCAL_IP = _local_ip()
+
+# On Windows, .cmd files must be invoked via cmd.exe
+def _claude_cmd(*args: str) -> list[str]:
+    if CLAUDE_BIN.lower().endswith(".cmd"):
+        return ["cmd", "/c", CLAUDE_BIN, *args]
+    return [CLAUDE_BIN, *args]
+
+# Locate bash — on Windows the scheduled task may not have Git on PATH
+_GIT_BASH_CANDIDATES = [
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+    r"C:\Program Files\Git\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+]
+BASH_BIN: str = (
+    shutil.which("bash")
+    or next((p for p in _GIT_BASH_CANDIDATES if Path(p).exists()), None)
+    or "bash"
+)
+
+
+def _push_log(line: str) -> None:
+    """Send a log line to the API. Fire-and-forget."""
+    try:
+        data = json.dumps({"runner": "build_runner", "line": line}).encode()
+        req = urllib.request.Request(
+            f"{API_BASE}/api/status/log",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass
+
+
+_builtin_print = print
+
+
+def print(*args, **kwargs):  # noqa: A001
+    """Override print to also forward output to the API log endpoint."""
+    _builtin_print(*args, **kwargs)
+    line = " ".join(str(a) for a in args)
+    _push_log(line)
 
 # ─── Port registry ────────────────────────────────────────────────────────────
 # All port management lives in the 9000+ range.
@@ -366,13 +426,12 @@ def run_claude_agent(target_dir: Path, prompt: str, item_id: str, session_id: st
     Stream every meaningful event to the build log.
     Returns True on success.
     """
-    cmd = [
-        CLAUDE_BIN,
+    cmd = _claude_cmd(
         "-p", prompt,
         "--dangerously-skip-permissions",
         "--output-format", "stream-json",
         "--verbose",
-    ]
+    )
 
     print(f"  [claude] spawning agent in {target_dir}")
     post_log(item_id, session_id, f"🤖 Claude agent started in {target_dir.name}/")
@@ -591,14 +650,18 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 start.sh MUST:
 - Set port defaults at the top using the above pattern
+- Also set: PYTHON="${PYTHON:-$(which python3 2>/dev/null || which python)}"
 - mkdir -p .pids .logs
-- For Python backends: check for venv with `[ ! -f venv/bin/uvicorn ]` (or flask/gunicorn) and create+install if missing
-- For Node frontends: check for node_modules with `[ ! -d frontend/node_modules ]` and npm install if missing
-- Wait for PostgreSQL with `pg_isready -d postgres` (not the app db, which may not exist yet)
+- For Python backends: check for venv Scripts/uvicorn.exe (Windows) or bin/uvicorn (Unix) and create+install if missing; use full venv path
+- For Node (Vite/React): check for node_modules and npm install if missing; pass --port and --host 0.0.0.0
+- For Next.js: use `npm run dev -- -p $FRONTEND_PORT` (Next uses -p not --port)
+- For NestJS: use `PORT=$API_PORT npm run start:dev`
+- For PHP or plain HTML: use `php -S 0.0.0.0:$APP_PORT -t ./public` (or ./ if no public/ dir); use $(which php) for portability
+- For PostgreSQL: wait with `pg_isready -d postgres` before starting dependent services
 - Start each process in the background (&), redirect stdout+stderr to .logs/<name>.log
 - Write each PID: echo $! > .pids/<name>.pid
-- Use full venv path for Python: `$ROOT_DIR/backend/venv/bin/uvicorn` not just `uvicorn`
-- Print: echo "Started. Open: http://localhost:$FRONTEND_PORT"
+- On Windows the venv executables are in Scripts/ not bin/ — check both: `Scripts/uvicorn.exe` then `bin/uvicorn`
+- Print: echo "Started. Open: http://localhost:$FRONTEND_PORT" (or $APP_PORT for single-process)
 
 stop.sh MUST:
 - Loop over .pids/*.pid, kill each, remove file
@@ -631,44 +694,102 @@ def _generate_start_sh(target_dir: Path, slug: str, item_id: str | None = None,
 
     try:
         proc = subprocess.run(
-            [CLAUDE_BIN, "-p", NATIVE_SETUP_PROMPT, "--dangerously-skip-permissions",
-             "--output-format", "stream-json", "--verbose"],
+            _claude_cmd("-p", NATIVE_SETUP_PROMPT, "--dangerously-skip-permissions",
+             "--output-format", "stream-json", "--verbose"),
             cwd=str(target_dir),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=180,
         )
-        # Parse result from stream
-        success = False
+        # Parse stream-json for a result event (best-effort; format varies by CLI version)
+        stream_ok = False
         for line in proc.stdout.splitlines():
             try:
                 ev = json.loads(line)
                 if ev.get("type") == "result":
-                    success = not ev.get("is_error", False)
+                    stream_ok = not ev.get("is_error", False)
             except Exception:
                 pass
 
-        if success and (target_dir / "start.sh").exists():
-            (target_dir / "start.sh").chmod(0o755)
+        start_path = target_dir / "start.sh"
+        # Trust the filesystem: if start.sh exists, Claude did its job even when
+        # stream-json did not emit a parseable "result" line (or output was wrapped).
+        if start_path.exists():
+            start_path.chmod(0o755)
             if (target_dir / "stop.sh").exists():
                 (target_dir / "stop.sh").chmod(0o755)
             print(f"  [run] Claude generated start.sh for {slug}")
             return True
+
+        err_tail = (proc.stderr or "").strip()
+        if err_tail:
+            print(f"  [run] Claude stderr: {err_tail[:800]}")
+        if proc.returncode != 0:
+            print(f"  [run] Claude exited {proc.returncode}; falling back to heuristic")
+        elif not stream_ok:
+            print(f"  [run] Claude finished without start.sh (stream_ok={stream_ok}); falling back to heuristic")
+        else:
+            print(f"  [run] Claude reported success but start.sh missing; falling back to heuristic")
     except Exception as e:
         print(f"  [run] Claude failed ({e}), falling back to heuristic")
 
     # ── Heuristic fallback ────────────────────────────────────────────────────
-    has_frontend = (target_dir / "frontend").is_dir()
-    has_backend = (target_dir / "backend").is_dir()
+    backend_req = target_dir / "backend" / "requirements.txt"
+    has_pyproject_backend = (target_dir / "backend" / "pyproject.toml").exists()
+    # Prefer frontend/, else first alternate with package.json (Vite apps often use client/ or web/)
+    frontend_subdir = "frontend"
+    if not (target_dir / "frontend").is_dir():
+        for name in ("client", "web", "ui"):
+            if (target_dir / name).is_dir() and (target_dir / name / "package.json").exists():
+                frontend_subdir = name
+                break
+    has_frontend = (target_dir / frontend_subdir).is_dir()
+    has_backend  = (target_dir / "backend").is_dir()
     has_requirements = (
         (target_dir / "requirements.txt").exists()
-        or (target_dir / "backend" / "requirements.txt").exists()
+        or backend_req.exists()
     )
-    has_app_py = (target_dir / "app.py").exists()
-    has_vite = any((target_dir / f).exists() for f in [
-        "vite.config.ts", "vite.config.js",
-        "frontend/vite.config.ts", "frontend/vite.config.js",
-    ])
-    has_pkg = (target_dir / "package.json").exists()
+    has_app_py  = (target_dir / "app.py").exists()
+    has_laravel = (target_dir / "artisan").exists() and (target_dir / "composer.json").exists()
+
+    # Node project detection helpers
+    def _pkg(d: Path) -> dict:
+        p = d / "package.json"
+        if p.exists():
+            try:
+                import json as _j; return _j.loads(p.read_text())
+            except Exception:
+                pass
+        return {}
+
+    root_pkg      = _pkg(target_dir)
+    frontend_pkg  = _pkg(target_dir / frontend_subdir)
+    backend_pkg   = _pkg(target_dir / "backend")
+
+    def _is_next(pkg: dict)   -> bool: return "next" in pkg.get("dependencies", {}) or "next" in pkg.get("devDependencies", {})
+    def _is_nest(pkg: dict)   -> bool: return "@nestjs/core" in pkg.get("dependencies", {})
+    def _is_vite(pkg: dict)   -> bool: return "vite" in pkg.get("devDependencies", {}) or "vite" in pkg.get("dependencies", {})
+    def _has_dev(pkg: dict)   -> bool: return "dev" in pkg.get("scripts", {})
+
+    has_vite = (
+        any((target_dir / f).exists() for f in ["vite.config.ts", "vite.config.js"])
+        or any((target_dir / frontend_subdir / f).exists() for f in ["vite.config.ts", "vite.config.js"])
+        or _is_vite(root_pkg) or _is_vite(frontend_pkg)
+    )
+    _fe_dir = f'"$ROOT_DIR/{frontend_subdir}"'
+    has_pkg = bool(root_pkg)
+
+    # PHP / HTML detection
+    php_files  = list(target_dir.glob("*.php")) + list(target_dir.glob("public/*.php")) + list((target_dir / "src").glob("*.php") if (target_dir / "src").exists() else [])
+    html_files = list(target_dir.glob("*.html")) + list(target_dir.glob("public/*.html"))
+    has_php    = bool(php_files) or (target_dir / "composer.json").exists()
+    has_html   = bool(html_files) and not has_php
+    # Serve HTML through PHP dev server too (gracefully handles future PHP additions)
+    serve_via_php = has_php or has_html
+
+    # Determine public root for PHP server
+    php_docroot = '"$ROOT_DIR/public"' if (target_dir / "public").is_dir() else '"$ROOT_DIR"'
+
+    py_exe = sys.executable.replace(chr(92), "/")
 
     lines = [
         "#!/usr/bin/env bash", "set -e",
@@ -681,39 +802,134 @@ def _generate_start_sh(target_dir: Path, slug: str, item_id: str | None = None,
         "FRONTEND_PORT=${FRONTEND_PORT:-3000}",
         "API_PORT=${API_PORT:-8000}",
         "APP_PORT=${APP_PORT:-5000}",
+        f'PYTHON="${{PYTHON:-{py_exe}}}"',
         "", "mkdir -p .pids .logs", "",
     ]
     generated = False
 
-    if has_backend and has_requirements:
+    # ── Python FastAPI/uvicorn backend ────────────────────────────────────────
+    # Backend deps must live under backend/ (root-level requirements.txt alone is ambiguous)
+    if has_backend and (backend_req.exists() or has_pyproject_backend):
+        if backend_req.exists():
+            _pip_install = (
+                '  "$ROOT_DIR/backend/venv/Scripts/pip.exe" install -q -r "$ROOT_DIR/backend/requirements.txt" '
+                '2>/dev/null || "$ROOT_DIR/backend/venv/bin/pip" install -q -r "$ROOT_DIR/backend/requirements.txt"'
+            )
+        else:
+            _pip_install = (
+                '  "$ROOT_DIR/backend/venv/Scripts/pip.exe" install -q -e "$ROOT_DIR/backend" '
+                '2>/dev/null || "$ROOT_DIR/backend/venv/bin/pip" install -q -e "$ROOT_DIR/backend"'
+            )
         lines += [
-            'if [ ! -f "$ROOT_DIR/backend/venv/bin/uvicorn" ]; then',
+            'if [ ! -f "$ROOT_DIR/backend/venv/Scripts/uvicorn.exe" ] && [ ! -f "$ROOT_DIR/backend/venv/bin/uvicorn" ]; then',
             '  echo "Creating backend venv..."',
-            '  python3 -m venv "$ROOT_DIR/backend/venv"',
-            '  "$ROOT_DIR/backend/venv/bin/pip" install -q -r "$ROOT_DIR/backend/requirements.txt"',
+            '  "$PYTHON" -m venv "$ROOT_DIR/backend/venv"',
+            _pip_install,
             "fi",
-            '(cd "$ROOT_DIR/backend" && "$ROOT_DIR/backend/venv/bin/uvicorn" app.main:app --host 0.0.0.0 --port "$API_PORT" > "$ROOT_DIR/.logs/api.log" 2>&1) &',
+            'UVICORN="$ROOT_DIR/backend/venv/Scripts/uvicorn.exe"; [ -f "$UVICORN" ] || UVICORN="$ROOT_DIR/backend/venv/bin/uvicorn"',
+            '(cd "$ROOT_DIR/backend" && "$UVICORN" app.main:app --host 0.0.0.0 --port "$API_PORT" > "$ROOT_DIR/.logs/api.log" 2>&1) &',
             'echo $! > "$ROOT_DIR/.pids/api.pid"', "",
         ]
         generated = True
+
+    # ── NestJS backend ────────────────────────────────────────────────────────
+    if _is_nest(backend_pkg) and has_backend:
+        lines += [
+            'if [ ! -d "$ROOT_DIR/backend/node_modules" ]; then npm --prefix "$ROOT_DIR/backend" install --silent; fi',
+            '(cd "$ROOT_DIR/backend" && PORT="$API_PORT" npm run start:dev > "$ROOT_DIR/.logs/api.log" 2>&1) &',
+            'echo $! > "$ROOT_DIR/.pids/api.pid"', "",
+        ]
+        generated = True
+    elif _is_nest(root_pkg) and not has_frontend:
+        lines += [
+            'if [ ! -d "$ROOT_DIR/node_modules" ]; then npm install --silent; fi',
+            '(cd "$ROOT_DIR" && PORT="$API_PORT" npm run start:dev > "$ROOT_DIR/.logs/api.log" 2>&1) &',
+            'echo $! > "$ROOT_DIR/.pids/api.pid"', "",
+        ]
+        generated = True
+
+    # ── Plain Flask/Python app ────────────────────────────────────────────────
     if has_app_py:
         lines += [
-            'if [ ! -f "$ROOT_DIR/venv/bin/python" ]; then python3 -m venv "$ROOT_DIR/venv" && "$ROOT_DIR/venv/bin/pip" install -q -r "$ROOT_DIR/requirements.txt" 2>/dev/null || true; fi',
-            'PORT="$APP_PORT" "$ROOT_DIR/venv/bin/python" app.py > "$ROOT_DIR/.logs/app.log" 2>&1 &',
+            'if [ ! -f "$ROOT_DIR/venv/Scripts/python.exe" ] && [ ! -f "$ROOT_DIR/venv/bin/python" ]; then',
+            '  "$PYTHON" -m venv "$ROOT_DIR/venv"',
+            '  "$ROOT_DIR/venv/Scripts/pip.exe" install -q -r "$ROOT_DIR/requirements.txt" 2>/dev/null || "$ROOT_DIR/venv/bin/pip" install -q -r "$ROOT_DIR/requirements.txt" 2>/dev/null || true',
+            "fi",
+            'VENV_PY="$ROOT_DIR/venv/Scripts/python.exe"; [ -f "$VENV_PY" ] || VENV_PY="$ROOT_DIR/venv/bin/python"',
+            'PORT="$APP_PORT" "$VENV_PY" app.py > "$ROOT_DIR/.logs/app.log" 2>&1 &',
             'echo $! > "$ROOT_DIR/.pids/app.pid"', "",
         ]
         generated = True
-    if has_frontend and has_vite:
+
+    # ── Next.js (frontend/subfolder or root) ──────────────────────────────────
+    if _is_next(frontend_pkg) and has_frontend:
         lines += [
-            'if [ ! -d "$ROOT_DIR/frontend/node_modules" ]; then npm --prefix "$ROOT_DIR/frontend" install --silent; fi',
-            '(cd "$ROOT_DIR/frontend" && npm run dev -- --port "$FRONTEND_PORT" --host 0.0.0.0 > "$ROOT_DIR/.logs/frontend.log" 2>&1) &',
+            f'if [ ! -d "$ROOT_DIR/{frontend_subdir}/node_modules" ]; then npm --prefix "$ROOT_DIR/{frontend_subdir}" install --silent; fi',
+            f'(cd {_fe_dir} && npm run dev -- -p "$FRONTEND_PORT" > "$ROOT_DIR/.logs/frontend.log" 2>&1) &',
             'echo $! > "$ROOT_DIR/.pids/frontend.pid"', "",
         ]
         generated = True
-    elif has_pkg and not has_backend:
+    elif _is_next(root_pkg):
         lines += [
-            'if [ ! -d "$ROOT_DIR/node_modules" ]; then npm --prefix "$ROOT_DIR" install --silent; fi',
+            'if [ ! -d "$ROOT_DIR/node_modules" ]; then npm install --silent; fi',
+            '(cd "$ROOT_DIR" && npm run dev -- -p "$FRONTEND_PORT" > "$ROOT_DIR/.logs/app.log" 2>&1) &',
+            'echo $! > "$ROOT_DIR/.pids/app.pid"', "",
+        ]
+        generated = True
+
+    # ── Vite frontend ─────────────────────────────────────────────────────────
+    elif has_frontend and has_vite:
+        lines += [
+            f'if [ ! -d "$ROOT_DIR/{frontend_subdir}/node_modules" ]; then npm --prefix "$ROOT_DIR/{frontend_subdir}" install --silent; fi',
+            f'(cd {_fe_dir} && npm run dev -- --port "$FRONTEND_PORT" --host 0.0.0.0 > "$ROOT_DIR/.logs/frontend.log" 2>&1) &',
+            'echo $! > "$ROOT_DIR/.pids/frontend.pid"', "",
+        ]
+        generated = True
+    elif _is_vite(root_pkg) or (has_pkg and _has_dev(root_pkg) and not has_backend and not serve_via_php):
+        lines += [
+            'if [ ! -d "$ROOT_DIR/node_modules" ]; then npm install --silent; fi',
             '(cd "$ROOT_DIR" && npm run dev -- --port "$FRONTEND_PORT" --host 0.0.0.0 > "$ROOT_DIR/.logs/app.log" 2>&1) &',
+            'echo $! > "$ROOT_DIR/.pids/app.pid"', "",
+        ]
+        generated = True
+
+    # ── Laravel ───────────────────────────────────────────────────────────────
+    _php_search = (
+        'PHP_BIN=""; '
+        'for _p in /c/xampp/php/php.exe /c/php/php.exe /c/php8/php.exe /c/php82/php.exe /c/php83/php.exe '
+        '"/c/Program Files/PHP/php.exe" "$(which php 2>/dev/null || true)"; do '
+        '[ -f "$_p" ] && PHP_BIN="$_p" && break; done; '
+        '[ -z "$PHP_BIN" ] && { echo "ERROR: PHP not found" >&2; exit 1; }'
+    )
+    if has_laravel:
+        lines += [
+            _php_search,
+            '"$PHP_BIN" artisan migrate --force 2>/dev/null || true',
+            '"$PHP_BIN" artisan serve --host=0.0.0.0 --port="$APP_PORT" > "$ROOT_DIR/.logs/app.log" 2>&1 &',
+            'echo $! > "$ROOT_DIR/.pids/app.pid"',
+            'if [ -f "$ROOT_DIR/package.json" ]; then',
+            '  if [ ! -d "$ROOT_DIR/node_modules" ]; then npm --prefix "$ROOT_DIR" install --silent; fi',
+            '  (cd "$ROOT_DIR" && npm run dev > "$ROOT_DIR/.logs/vite.log" 2>&1) &',
+            '  echo $! > "$ROOT_DIR/.pids/vite.pid"',
+            'fi', "",
+        ]
+        generated = True
+
+    # ── PHP / HTML (served via PHP built-in dev server) ───────────────────────
+    elif serve_via_php:
+        lines += [
+            _php_search,
+            f'(cd "$ROOT_DIR" && "$PHP_BIN" -S 0.0.0.0:"$APP_PORT" -t {php_docroot} > "$ROOT_DIR/.logs/app.log" 2>&1) &',
+            'echo $! > "$ROOT_DIR/.pids/app.pid"',
+            'echo "Started. Open: http://localhost:${APP_PORT}"', "",
+        ]
+        generated = True
+
+    # ── Generic Node (package.json with dev script) ───────────────────────────
+    if not generated and has_pkg and _has_dev(root_pkg):
+        lines += [
+            'if [ ! -d "$ROOT_DIR/node_modules" ]; then npm install --silent; fi',
+            '(cd "$ROOT_DIR" && npm run dev > "$ROOT_DIR/.logs/app.log" 2>&1) &',
             'echo $! > "$ROOT_DIR/.pids/app.pid"', "",
         ]
         generated = True
@@ -767,9 +983,24 @@ def start_project(item: dict, session_id: str) -> None:
         env["API_PORT"]      = str(ports["api"])
         env["DB_PORT"]       = str(ports["db"])
         env["APP_PORT"]      = str(ports["frontend"])  # single-process apps
+        env["PYTHON"]        = sys.executable           # so start.sh can use $PYTHON instead of python3
+
+        # On Windows, Git Bash invoked without --login doesn't source /etc/profile,
+        # so basic Unix tools (dirname, mkdir, etc.) are missing from PATH.
+        # Prepend known Git for Windows bin directories unconditionally.
+        if sys.platform == "win32":
+            git_unix_paths = [
+                r"C:\Program Files\Git\usr\bin",
+                r"C:\Program Files\Git\bin",
+                r"C:\Program Files (x86)\Git\usr\bin",
+                r"C:\Program Files (x86)\Git\bin",
+            ]
+            extra = os.pathsep.join(p for p in git_unix_paths if Path(p).exists())
+            if extra:
+                env["PATH"] = extra + os.pathsep + env.get("PATH", "")
 
         result = subprocess.run(
-            ["bash", "start.sh"],
+            [BASH_BIN, "--login", "start.sh"],
             cwd=str(target_dir),
             capture_output=True, text=True, timeout=120,
             env=env,
@@ -779,7 +1010,7 @@ def start_project(item: dict, session_id: str) -> None:
             set_run_result(item_id, session_id, "failed")
             return
 
-        run_url = f"http://localhost:{ports['frontend']}"
+        run_url = f"http://{LOCAL_IP}:{ports['frontend']}"
         print(f"  [run] Started. URL: {run_url}")
         set_run_result(item_id, session_id, "running", run_url)
 
@@ -805,7 +1036,7 @@ def stop_project(item: dict, session_id: str) -> None:
     if stop_script.exists():
         try:
             stop_script.chmod(stop_script.stat().st_mode | 0o111)
-            subprocess.run(["bash", "stop.sh"], cwd=str(target_dir),
+            subprocess.run([BASH_BIN, "stop.sh"], cwd=str(target_dir),
                            capture_output=True, text=True, timeout=30)
         except Exception:
             pass
@@ -925,13 +1156,12 @@ def run_claude_agent_for_task(target_dir: Path, prompt: str,
     Returns (success, rate_limited).
     Streams output to the task's agent_response field.
     """
-    cmd = [
-        CLAUDE_BIN,
+    cmd = _claude_cmd(
         "-p", prompt,
         "--dangerously-skip-permissions",
         "--output-format", "stream-json",
         "--verbose",
-    ]
+    )
 
     print(f"  [task] Running Claude for task {task_id[:8]}... in {target_dir.name}/")
     append_task_output(item_id, task_id, f"🤖 Agent started in {target_dir.name}/\n")

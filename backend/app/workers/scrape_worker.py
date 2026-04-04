@@ -21,6 +21,18 @@ from app.nlp.entity_extraction import AppNameExtractor
 logger = logging.getLogger(__name__)
 
 
+class _ApiLogHandler(logging.Handler):
+    """Forwards log records to the API status/log endpoint."""
+    def emit(self, record: logging.LogRecord) -> None:
+        from app.workers.heartbeat_worker import push_celery_log
+        push_celery_log(self.format(record))
+
+
+_api_handler = _ApiLogHandler()
+_api_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(_api_handler)
+
+
 async def _run_with_cleanup(coro):
     try:
         return await coro

@@ -350,13 +350,69 @@ async def get_project_services(
     registry = _read_port_registry()
     port_entry = registry.get(slug, {})
 
-    return {
-        "slug": slug,
-        "services": [
-            {"name": svc, "ports": [{"host": port, "container": port}]}
-            for svc, port in port_entry.items()
-        ],
+    # Detect actual services from project structure rather than blindly returning
+    # all three allocated ports (frontend/api/db).
+    project_dir = Path(settings.repos_path) / slug
+    pids_dir    = project_dir / ".pids"
+
+    # If .pids/ exists, use running pid files as the ground truth
+    if pids_dir.exists():
+        pid_names = {f.stem for f in pids_dir.glob("*.pid")}  # e.g. {"app", "vite", "api"}
+    else:
+        pid_names = set()
+
+    # Map pid names → canonical service names → ports
+    _pid_to_service = {
+        "app":      "frontend",
+        "frontend": "frontend",
+        "web":      "frontend",
+        "api":      "api",
+        "backend":  "api",
+        "vite":     "frontend",
+        "db":       "db",
+        "database": "db",
     }
+
+    # Determine which services actually exist by checking:
+    # 1. If .pids/ has files, use those
+    # 2. Otherwise, infer from directory/file structure
+    if pid_names:
+        seen = set()
+        active_services: list[str] = []
+        for pid in pid_names:
+            svc = _pid_to_service.get(pid, pid)
+            if svc not in seen:
+                seen.add(svc)
+                active_services.append(svc)
+    else:
+        # Fall back to inspecting the project directory
+        has_frontend_dir = (project_dir / "frontend").is_dir()
+        has_backend_dir  = (project_dir / "backend").is_dir()
+        has_artisan      = (project_dir / "artisan").exists()
+        has_pkg          = (project_dir / "package.json").exists()
+        has_composer     = (project_dir / "composer.json").exists()
+        has_app_py       = (project_dir / "app.py").exists()
+        has_requirements = (project_dir / "requirements.txt").exists() or (project_dir / "backend" / "requirements.txt").exists()
+
+        active_services = []
+        if has_frontend_dir or has_pkg or has_artisan or has_composer or has_app_py:
+            active_services.append("frontend")
+        if has_backend_dir and has_requirements:
+            active_services.append("api")
+        # Include db for anything with a real backend or a Laravel/PHP app
+        if "api" in active_services or has_artisan or has_composer:
+            active_services.append("db")
+
+    # Port lookup: frontend port for "frontend", api port for "api", db for "db"
+    _svc_port_key = {"frontend": "frontend", "api": "api", "db": "db"}
+    services = []
+    for svc in active_services:
+        port_key = _svc_port_key.get(svc, "frontend")
+        port = port_entry.get(port_key)
+        if port:
+            services.append({"name": svc, "ports": [{"host": port, "container": port}]})
+
+    return {"slug": slug, "services": services}
 
 
 @router.get("/{item_id}/logs/{service}")
@@ -387,7 +443,19 @@ async def get_service_logs(
         raise HTTPException(status_code=422, detail="Invalid app plan")
 
     slug = re.sub(r"[^a-z0-9\-]", "", plan.get("slug", "")).lower()
-    log_file = Path(settings.repos_path) / slug / ".logs" / f"{service}.log"
+    logs_dir = Path(settings.repos_path) / slug / ".logs"
+
+    # Try the exact name first, then common aliases for single-process apps
+    _aliases = {
+        "frontend": ["frontend", "app", "web"],
+        "api":      ["api", "app", "backend", "server"],
+        "db":       ["db", "database"],
+    }
+    candidates = _aliases.get(service, [service]) + ["app"]
+    log_file = next(
+        (logs_dir / f"{c}.log" for c in candidates if (logs_dir / f"{c}.log").exists()),
+        logs_dir / f"{service}.log",  # fallback to original (will show not-found message)
+    )
 
     if not log_file.exists():
         return {"service": service, "lines": [f"[no log file at {log_file}]"]}
@@ -484,6 +552,18 @@ async def start_project(
 
     item.run_status = "starting"
     item.run_url = None
+
+    # Clear stale log files so the UI shows a fresh slate on next run
+    try:
+        slug = re.sub(r"[^a-z0-9\-]", "", json.loads(item.app_plan or "{}").get("slug", ""))
+        if slug:
+            logs_dir = Path(settings.repos_path) / slug / ".logs"
+            if logs_dir.exists():
+                for f in logs_dir.glob("*.log"):
+                    f.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     await db.commit()
     return {"status": "starting", "item_id": str(item_id)}
 

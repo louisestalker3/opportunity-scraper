@@ -47,5 +47,10 @@
     "frontend": 9026,
     "api": 9027,
     "db": 9028
+  },
+  "GeekGate": {
+    "frontend": 9029,
+    "api": 9030,
+    "db": 9031
   }
 }

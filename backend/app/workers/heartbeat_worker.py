@@ -11,6 +11,18 @@ logger = logging.getLogger(__name__)
 _API_BASE = os.environ.get("API_BASE", "http://localhost:9000")
 
 
+def push_celery_log(line: str) -> None:
+    """Push a log line to the status endpoint. Fire-and-forget."""
+    try:
+        httpx.post(
+            f"{_API_BASE}/api/status/log",
+            json={"runner": "celery", "line": line},
+            timeout=2,
+        )
+    except Exception:
+        pass
+
+
 @celery_app.task(name="app.workers.heartbeat_worker.send_heartbeat", ignore_result=True)
 def send_heartbeat():
     try:

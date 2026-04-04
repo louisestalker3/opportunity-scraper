@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Outlet, NavLink } from "react-router-dom";
-import { TrendingUp, Kanban, Home, RefreshCw, Boxes, FlaskConical, Settings } from "lucide-react";
+import { TrendingUp, Kanban, Home, RefreshCw, Boxes, FlaskConical, Settings, Activity } from "lucide-react";
 import { api } from "@/api/client";
 import RunnerStatus from "@/components/RunnerStatus";
 
@@ -90,6 +90,7 @@ export default function App() {
               <NavItem to="/pipeline" icon={Kanban} label="My Pipeline" />
               <NavItem to="/projects" icon={Boxes} label="Projects" />
               <NavItem to="/analyze" icon={FlaskConical} label="Analyze" />
+              <NavItem to="/system" icon={Activity} label="System" />
               <NavItem to="/settings" icon={Settings} label="Settings" />
               <ScraperButton />
               <RunnerStatus />

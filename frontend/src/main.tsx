@@ -11,6 +11,7 @@ import Projects from "./pages/Projects";
 import ProjectDetail from "./pages/ProjectDetail";
 import CloneAnalysis from "./pages/CloneAnalysis";
 import Settings from "./pages/Settings";
+import System from "./pages/System";
 
 import "./index.css";
 
@@ -35,6 +36,7 @@ const router = createBrowserRouter([
       { path: "project/:id", element: <ProjectDetail /> },
       { path: "analyze", element: <CloneAnalysis /> },
       { path: "settings", element: <Settings /> },
+      { path: "system", element: <System /> },
     ],
   },
 ]);

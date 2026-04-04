@@ -163,22 +163,23 @@ export default function RunPanel({
           {/* Port strip */}
           {currentService && currentService.ports.length > 0 && (
             <div className="flex items-center gap-4 px-4 py-2 bg-gray-950 border-b border-gray-800">
-              {currentService.ports.map((p) => (
-                <div key={p.host}>
-                  {isRunning ? (
-                    <a
-                      href={`http://localhost:${p.host}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-xs font-mono text-emerald-400 hover:underline flex items-center gap-1"
-                    >
-                      localhost:{p.host} <ExternalLink size={9} />
-                    </a>
-                  ) : (
-                    <span className="text-xs font-mono text-gray-500">localhost:{p.host}</span>
-                  )}
-                </div>
-              ))}
+              {currentService.ports.map((p) => {
+                const urlHost = (() => { try { return new URL(runUrl ?? "").hostname; } catch { return "localhost"; } })();
+                const href = `http://${urlHost}:${p.host}`;
+                return (
+                  <div key={p.host}>
+                    {isRunning ? (
+                      <a href={href} target="_blank" rel="noopener noreferrer"
+                        className="text-xs font-mono text-emerald-400 hover:underline flex items-center gap-1"
+                      >
+                        {urlHost}:{p.host} <ExternalLink size={9} />
+                      </a>
+                    ) : (
+                      <span className="text-xs font-mono text-gray-500">{urlHost}:{p.host}</span>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
 

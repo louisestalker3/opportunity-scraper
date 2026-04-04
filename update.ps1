@@ -2,13 +2,27 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = "C:\Users\louis\repos\opportunity-scraper"
 $Python = "C:\Users\louis\AppData\Local\Programs\Python\Python312\python.exe"
 $Npm = "C:\Program Files\nodejs\npm.cmd"
+$env:PATH = "C:\Users\louis\AppData\Roaming\npm;" + $env:PATH
 
 Write-Host "==> Stopping services..." -ForegroundColor Cyan
-Stop-ScheduledTask -TaskName "OpportunityScraper-Backend"    -ErrorAction SilentlyContinue
-Stop-ScheduledTask -TaskName "OpportunityScraper-Celery"     -ErrorAction SilentlyContinue
-Stop-ScheduledTask -TaskName "OpportunityScraper-CeleryBeat" -ErrorAction SilentlyContinue
-Stop-ScheduledTask -TaskName "OpportunityScraper-Frontend"   -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 3
+Stop-ScheduledTask -TaskName "OpportunityScraper-Backend"     -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName "OpportunityScraper-Celery"      -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName "OpportunityScraper-CeleryBeat"  -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName "OpportunityScraper-Frontend"    -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName "OpportunityScraper-BuildRunner" -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+
+# Kill any stale python processes left over from previous runs
+Get-WmiObject Win32_Process | Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*celery*" } | ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+}
+Get-WmiObject Win32_Process | Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*uvicorn*" } | ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+}
+Get-WmiObject Win32_Process | Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*build_runner*" } | ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+}
+Start-Sleep -Seconds 2
 
 Write-Host "==> Pulling latest code..." -ForegroundColor Cyan
 Set-Location $ProjectRoot
@@ -30,6 +44,7 @@ Start-ScheduledTask -TaskName "OpportunityScraper-Backend"
 Start-ScheduledTask -TaskName "OpportunityScraper-Celery"
 Start-ScheduledTask -TaskName "OpportunityScraper-CeleryBeat"
 Start-ScheduledTask -TaskName "OpportunityScraper-Frontend"
+Start-ScheduledTask -TaskName "OpportunityScraper-BuildRunner"
 Start-Sleep -Seconds 3
 
 Write-Host "==> Status:" -ForegroundColor Cyan

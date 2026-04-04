@@ -675,6 +675,9 @@ export default function ProjectDetail() {
 
   const [tab, setTab] = useState<Tab>("branding");
 
+  // Must be called before any early returns (Rules of Hooks)
+  const { data: tasks = [] } = useTasks(item?.id ?? "");
+
   if (isLoading) {
     return (
       <div className="space-y-6 animate-pulse">
@@ -707,7 +710,6 @@ export default function ProjectDetail() {
   const runStatus = item.run_status ?? null;
 
   // Badge counts for tab labels
-  const { data: tasks = [] } = useTasks(item.id);
   const activeTaskCount = tasks.filter((t) => t.status === "ready" || t.status === "in_progress").length;
 
   return (
