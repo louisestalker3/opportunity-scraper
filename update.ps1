@@ -1,53 +1,53 @@
+<#
+.SYNOPSIS
+  Full Opportunity Scraper maintenance: stop stack, kill stray runners, clear lock files,
+  reset stuck DB rows, pull code, install deps, migrate, then start scheduled tasks.
+
+  Same safety steps as restart-opportunity-scraper.ps1, plus git pull / pip / alembic / npm.
+#>
 $ErrorActionPreference = "Stop"
-$ProjectRoot = "C:\Users\louis\repos\opportunity-scraper"
+$ProjectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+. "$ProjectRoot\opportunity-scraper-common.ps1"
+
 $Python = "C:\Users\louis\AppData\Local\Programs\Python\Python312\python.exe"
+$Python = Resolve-OpportunityScraperPython -PreferredPath $Python
 $Npm = "C:\Program Files\nodejs\npm.cmd"
 $env:PATH = "C:\Users\louis\AppData\Roaming\npm;" + $env:PATH
 
 Write-Host "==> Stopping services..." -ForegroundColor Cyan
-Stop-ScheduledTask -TaskName "OpportunityScraper-Backend"     -ErrorAction SilentlyContinue
-Stop-ScheduledTask -TaskName "OpportunityScraper-Celery"      -ErrorAction SilentlyContinue
-Stop-ScheduledTask -TaskName "OpportunityScraper-CeleryBeat"  -ErrorAction SilentlyContinue
-Stop-ScheduledTask -TaskName "OpportunityScraper-Frontend"    -ErrorAction SilentlyContinue
-Stop-ScheduledTask -TaskName "OpportunityScraper-BuildRunner" -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
+Stop-OpportunityScraperScheduledTasks
 
-# Kill any stale python processes left over from previous runs
-Get-WmiObject Win32_Process | Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*celery*" } | ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+Write-Host "==> Killing leftover Python workers (celery, uvicorn, build_runner)..." -ForegroundColor Cyan
+Stop-OpportunityScraperPythonRunners
+
+Write-Host "==> Removing runner lock files in repo root..." -ForegroundColor Cyan
+Clear-OpportunityScraperRunnerLocks -ProjectRoot $ProjectRoot
+
+Write-Host "==> Resetting stuck tasks / pipeline rows in PostgreSQL..." -ForegroundColor Cyan
+$code = Invoke-OpportunityScraperRunnerDbReset -ProjectRoot $ProjectRoot -PythonExe $Python
+if ($code -ne 0) {
+    Write-Host "  WARNING: DB reset exited $code - is PostgreSQL running and DATABASE_URL correct in backend/.env?" -ForegroundColor Yellow
 }
-Get-WmiObject Win32_Process | Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*uvicorn*" } | ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-}
-Get-WmiObject Win32_Process | Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*build_runner*" } | ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-}
-Start-Sleep -Seconds 2
 
 Write-Host "==> Pulling latest code..." -ForegroundColor Cyan
 Set-Location $ProjectRoot
 git pull
 
 Write-Host "==> Installing backend dependencies..." -ForegroundColor Cyan
-& $Python -m pip install -r "$ProjectRoot\backend\requirements.txt" --quiet
+& $Python -m pip install -r (Join-Path $ProjectRoot "backend\requirements.txt") --quiet
 
 Write-Host "==> Running database migrations..." -ForegroundColor Cyan
-Set-Location "$ProjectRoot\backend"
+Set-Location (Join-Path $ProjectRoot "backend")
 & $Python -m alembic upgrade head
 
 Write-Host "==> Installing frontend dependencies..." -ForegroundColor Cyan
-Set-Location "$ProjectRoot\frontend"
+Set-Location (Join-Path $ProjectRoot "frontend")
 & $Npm install --silent
 
 Write-Host "==> Starting services..." -ForegroundColor Cyan
-Start-ScheduledTask -TaskName "OpportunityScraper-Backend"
-Start-ScheduledTask -TaskName "OpportunityScraper-Celery"
-Start-ScheduledTask -TaskName "OpportunityScraper-CeleryBeat"
-Start-ScheduledTask -TaskName "OpportunityScraper-Frontend"
-Start-ScheduledTask -TaskName "OpportunityScraper-BuildRunner"
-Start-Sleep -Seconds 3
+Start-OpportunityScraperScheduledTasks
 
 Write-Host "==> Status:" -ForegroundColor Cyan
-Get-ScheduledTask -TaskName "OpportunityScraper-*" | Select-Object TaskName, State | Format-Table -AutoSize
+Show-OpportunityScraperScheduledTaskState
 
 Write-Host "Done." -ForegroundColor Green

@@ -237,8 +237,9 @@ export function useStartProject() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => startProject(id),
-    onSuccess: () => {
+    onSuccess: (_, id) => {
       queryClient.invalidateQueries({ queryKey: keys.pipeline() });
+      queryClient.invalidateQueries({ queryKey: ["project-services", id] });
     },
   });
 }
@@ -247,8 +248,9 @@ export function useStopProject() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => stopProject(id),
-    onSuccess: () => {
+    onSuccess: (_, id) => {
       queryClient.invalidateQueries({ queryKey: keys.pipeline() });
+      queryClient.invalidateQueries({ queryKey: ["project-services", id] });
     },
   });
 }

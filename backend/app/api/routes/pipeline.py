@@ -23,6 +23,18 @@ from app.nlp.proposal_generator import generate_proposal
 # can poll the right pipeline items. Lives next to build_runner.py in the repo root.
 _SESSIONS_FILE = Path(__file__).resolve().parents[4] / ".build_sessions"
 
+
+def _ensure_session_registered(session_id: str) -> None:
+    """Append session id to .build_sessions so build_runner.py polls run/build ops."""
+    try:
+        _SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        existing = set(_SESSIONS_FILE.read_text().splitlines()) if _SESSIONS_FILE.exists() else set()
+        existing.add(session_id)
+        _SESSIONS_FILE.write_text("\n".join(sorted(existing)) + "\n")
+    except Exception:
+        pass
+
+
 router = APIRouter()
 
 VALID_STATUSES = {"watching", "considering", "building", "built", "dropped"}
@@ -208,14 +220,7 @@ async def trigger_build(
     item.build_log = None
     await db.commit()
 
-    # Record session ID so build_runner.py (running on the host) can poll the pipeline
-    try:
-        _SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        existing = set(_SESSIONS_FILE.read_text().splitlines()) if _SESSIONS_FILE.exists() else set()
-        existing.add(session_id)
-        _SESSIONS_FILE.write_text("\n".join(existing) + "\n")
-    except Exception:
-        pass
+    _ensure_session_registered(session_id)
 
     return {"status": "building", "item_id": str(item_id)}
 
@@ -393,11 +398,13 @@ async def get_project_services(
         has_composer     = (project_dir / "composer.json").exists()
         has_app_py       = (project_dir / "app.py").exists()
         has_requirements = (project_dir / "requirements.txt").exists() or (project_dir / "backend" / "requirements.txt").exists()
+        has_pyproject    = (project_dir / "backend" / "pyproject.toml").exists()
+        has_npm_backend  = (project_dir / "backend" / "package.json").exists()
 
         active_services = []
         if has_frontend_dir or has_pkg or has_artisan or has_composer or has_app_py:
             active_services.append("frontend")
-        if has_backend_dir and has_requirements:
+        if has_backend_dir and (has_requirements or has_pyproject or has_npm_backend):
             active_services.append("api")
         # Include db for anything with a real backend or a Laravel/PHP app
         if "api" in active_services or has_artisan or has_composer:
@@ -458,7 +465,13 @@ async def get_service_logs(
     )
 
     if not log_file.exists():
-        return {"service": service, "lines": [f"[no log file at {log_file}]"]}
+        return {
+            "service": service,
+            "lines": [
+                "Waiting for log output — the file appears once the process starts writing "
+                "(usually within a few seconds after start).",
+            ],
+        }
 
     try:
         all_lines = log_file.read_text(errors="replace").splitlines()
@@ -565,6 +578,7 @@ async def start_project(
         pass
 
     await db.commit()
+    _ensure_session_registered(session_id)
     return {"status": "starting", "item_id": str(item_id)}
 
 
@@ -589,6 +603,7 @@ async def stop_project(
 
     item.run_status = "stopping"
     await db.commit()
+    _ensure_session_registered(session_id)
     return {"status": "stopping", "item_id": str(item_id)}
 
 

@@ -21,6 +21,11 @@ from app.models.opportunity import Opportunity
 from app.models.pipeline_item import PipelineItem
 from app.models.project_task import ProjectTask
 from app.models.setting import Setting
+from app.services.import_port_normalization import (
+    build_app_plan_port_fields,
+    detect_ports_in_repo,
+    write_import_port_artifacts,
+)
 
 router = APIRouter()
 
@@ -257,8 +262,8 @@ async def scan_repos(db: AsyncSession = Depends(get_db)):
         remote = _git_remote(entry)
         description = _git_description(entry)
 
-        # Ensure every discovered repo has registry-allocated ports
-        _allocate_ports_for_slug(slug)
+        # Registry ports for this slug (used for app_plan + file artifacts)
+        ports = _allocate_ports_for_slug(slug)
 
         # Check if tracked by slug or by folder-name-as-app-name
         name_slug = re.sub(r"[^a-z0-9\-]", "-", slug.lower()).strip("-")
@@ -288,8 +293,12 @@ async def scan_repos(db: AsyncSession = Depends(get_db)):
             # Import it
             display_name = slug.replace("-", " ").replace("_", " ").title()
 
-            # Allocate ports in 9002+ range
-            ports = _allocate_ports_for_slug(slug)
+            detected = detect_ports_in_repo(entry)
+            written: list[str] = []
+            try:
+                written = write_import_port_artifacts(entry, slug, ports, detected)
+            except Exception:
+                written = []
 
             profile = AppProfile(
                 id=uuid.uuid4(),
@@ -329,12 +338,9 @@ async def scan_repos(db: AsyncSession = Depends(get_db)):
             await db.flush()
 
             import json
-            plan = json.dumps({
-                "slug": slug,
-                "app_name": display_name,
-                "scale": "large",
-                "ports": ports,
-            })
+            plan = json.dumps(
+                build_app_plan_port_fields(slug, display_name, ports, detected, written)
+            )
 
             pi = PipelineItem(
                 id=uuid.uuid4(),

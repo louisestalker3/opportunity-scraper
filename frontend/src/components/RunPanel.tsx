@@ -77,7 +77,7 @@ export default function RunPanel({
   const isTransitioning = runStatus === "starting" || runStatus === "stopping";
   const isActive = isRunning || isTransitioning;
 
-  const { data: servicesData } = useProjectServices(itemId, true);
+  const { data: servicesData, isLoading: servicesLoading } = useProjectServices(itemId, true);
   const services = servicesData?.services ?? [];
 
   const [activeTab, setActiveTab] = useState<string>("");
@@ -131,7 +131,9 @@ export default function RunPanel({
       </div>
 
       {/* Service tabs */}
-      {services.length > 0 ? (
+      {servicesLoading ? (
+        <div className="px-5 py-6 text-xs text-gray-400 text-center">Loading services…</div>
+      ) : services.length > 0 ? (
         <>
           <div className="flex border-b border-gray-100 bg-gray-50 overflow-x-auto">
             {services.map((svc) => {
@@ -188,7 +190,12 @@ export default function RunPanel({
           )}
         </>
       ) : (
-        <div className="px-5 py-6 text-xs text-gray-400 text-center">Loading services…</div>
+        <div className="px-5 py-6 text-xs text-gray-500 text-center space-y-1">
+          <p>No services detected for this project layout.</p>
+          <p className="text-gray-400">
+            If the app is starting, check the <span className="font-mono text-gray-500">build_runner</span> log on the System page.
+          </p>
+        </div>
       )}
     </div>
   );

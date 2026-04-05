@@ -34,7 +34,7 @@ function StatusBadge({ alive, ago }: { alive: boolean; ago: number | null }) {
   );
 }
 
-function LogPanel({ runner }: { runner: string }) {
+function LogPanel({ runner, alive }: { runner: string; alive: boolean }) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const color = RUNNER_COLORS[runner] ?? "gray";
@@ -70,7 +70,11 @@ function LogPanel({ runner }: { runner: string }) {
       className={`h-96 overflow-y-auto rounded-lg border font-mono text-xs p-3 space-y-0.5 ${colorClass[color] ?? colorClass.gray}`}
     >
       {!logs || logs.length === 0 ? (
-        <p className="text-gray-500 italic">No output yet…</p>
+        <p className="text-gray-500 italic">
+          {alive
+            ? "Connected — runner is idle or logs are still syncing. Lines appear when a build/run starts or when the next heartbeat posts output."
+            : "No output yet…"}
+        </p>
       ) : (
         logs.map((entry, i) => (
           <LogLine key={i} entry={entry} />
@@ -224,7 +228,10 @@ export default function System() {
             ))}
           </div>
         </div>
-        <LogPanel runner={activeRunner} />
+        <LogPanel
+          runner={activeRunner}
+          alive={runners?.find((r) => r.runner === activeRunner)?.alive ?? false}
+        />
       </div>
     </div>
   );

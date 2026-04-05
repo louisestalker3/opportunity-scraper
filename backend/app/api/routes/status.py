@@ -6,7 +6,11 @@ every few seconds. GET /api/status/runners returns each runner's name,
 last-seen timestamp, and whether it's considered alive (seen within 20s).
 
 Runners can also POST /api/status/log to push log lines that the UI can poll.
+
+Logs are also appended to a JSONL file so GET /logs survives uvicorn --reload
+and multiple workers (in-memory deque alone only worked for a single process).
 """
+import json
 import subprocess
 import sys
 import time
@@ -16,6 +20,9 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+_ROOT = Path(__file__).resolve().parents[4]
+_RUNNER_LOG_FILE = _ROOT / ".runner_logs.jsonl"
 
 router = APIRouter()
 
@@ -57,21 +64,54 @@ async def heartbeat(body: HeartbeatRequest) -> None:
     _heartbeats[body.runner] = time.time()
 
 
+def _append_runner_log_file(runner: str, line: str, ts: float) -> None:
+    try:
+        with open(_RUNNER_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": ts, "runner": runner, "line": line}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _read_runner_logs_from_file(runner: str, tail: int) -> list[LogEntry]:
+    if not _RUNNER_LOG_FILE.exists():
+        return []
+    matched: list[LogEntry] = []
+    try:
+        with open(_RUNNER_LOG_FILE, encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    o = json.loads(raw)
+                    if o.get("runner") == runner:
+                        matched.append(LogEntry(ts=o["ts"], line=o["line"]))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return matched[-tail:]
+
+
 @router.post("/log", status_code=204)
 async def push_log(body: LogRequest) -> None:
+    ts = time.time()
     if body.runner not in _logs:
         _logs[body.runner] = deque(maxlen=_LOG_MAX)
-    _logs[body.runner].append({"ts": time.time(), "line": body.line})
+    _logs[body.runner].append({"ts": ts, "line": body.line})
+    _append_runner_log_file(body.runner, body.line, ts)
 
 
 @router.get("/logs/{runner}", response_model=list[LogEntry])
 async def get_logs(runner: str, tail: int = 200) -> list[LogEntry]:
+    from_file = _read_runner_logs_from_file(runner, tail)
+    if from_file:
+        return from_file
     buf = _logs.get(runner, deque())
     entries = list(buf)
-    return entries[-tail:]
+    return [LogEntry(ts=e["ts"], line=e["line"]) for e in entries[-tail:]]
 
 
-_ROOT = Path(__file__).parents[4]
 _VENV_BIN = _ROOT / "backend" / "venv" / "bin"
 _VENV_SCRIPTS = _ROOT / "backend" / "venv" / "Scripts"  # Windows
 
@@ -125,6 +165,10 @@ async def restart_runner(runner: str) -> None:
 
     # Clear the log buffer so the UI shows a fresh slate
     _logs.pop(runner, None)
+    try:
+        _RUNNER_LOG_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
     proc = subprocess.Popen(cmd, cwd=cwd, env=env)
     _runner_procs[runner] = proc

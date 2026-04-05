@@ -59,6 +59,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+.runner_logs.jsonl
 
 # Playwright
 playwright-report/

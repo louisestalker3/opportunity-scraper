@@ -59,6 +59,365 @@ BASH_BIN: str = (
 )
 
 
+def _bash_git_usr_bin() -> Path | None:
+    """
+    Git for Windows: dirname.exe / mkdir.exe live in usr\\bin next to bash.exe.
+    Scheduled tasks often have an empty PATH — this path must not depend on env PATH.
+    """
+    candidates: list[Path] = []
+    wb = shutil.which("bash")
+    if wb:
+        try:
+            candidates.append(Path(wb).resolve())
+        except Exception:
+            pass
+    for cand in _GIT_BASH_CANDIDATES:
+        p = Path(cand)
+        if p.is_file():
+            try:
+                candidates.append(p.resolve())
+            except Exception:
+                pass
+    if Path(BASH_BIN).is_file():
+        try:
+            candidates.append(Path(BASH_BIN).resolve())
+        except Exception:
+            pass
+    for bash_p in candidates:
+        for parent in (bash_p.parent, bash_p.parent.parent):
+            usr_bin = parent / "usr" / "bin"
+            if usr_bin.is_dir():
+                return usr_bin
+    return None
+
+
+def _win_dir_to_msys_git_path(p: Path) -> str:
+    """Windows path -> MSYS path for export inside bash -c (spaces OK)."""
+    try:
+        s = str(p.resolve())
+    except Exception:
+        s = str(p)
+    if len(s) >= 3 and s[1] == ":" and s[2] in (os.sep, "/"):
+        drive = s[0].lower()
+        rest = s[3:].replace("\\", "/")
+        return f"/{drive}/{rest}"
+    return s.replace("\\", "/")
+
+
+def _bash_argv_run_start_sh() -> list[str]:
+    """
+    argv for running start.sh. On Windows, wrap in bash -c so PATH includes
+    Git usr/bin even when the parent env['PATH'] is empty or ignored by a child.
+    """
+    if sys.platform != "win32":
+        return [BASH_BIN, "start.sh"]
+    u = _bash_git_usr_bin()
+    if not u:
+        return [BASH_BIN, "start.sh"]
+    msys = _win_dir_to_msys_git_path(u)
+    return [
+        BASH_BIN,
+        "-c",
+        f'export PATH="{msys}:$PATH"; exec bash ./start.sh',
+    ]
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this PID exists (Windows + Unix)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but not ours — treat as holder alive
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
+def _try_acquire_side_lock(lock: Path) -> bool:
+    """
+    Cross-process lock for build/run/task. If a stale .lock file is left behind
+    after a crash, the recorded PID is dead — we remove it and acquire.
+
+    Returns True if this process owns the lock (caller must unlink in finally).
+    Returns False if another live process holds the lock.
+    """
+    if lock.exists():
+        try:
+            raw = lock.read_text().strip()
+            if raw.isdigit():
+                pid = int(raw)
+                if _pid_alive(pid):
+                    return False
+                print(f"[runner] Removing stale lock {lock.name} (pid {pid} not running)")
+        except Exception:
+            pass
+        try:
+            lock.unlink(missing_ok=True)
+        except Exception:
+            return False
+    try:
+        lock.write_text(str(os.getpid()))
+        return True
+    except Exception:
+        return False
+
+
+def _win_git_paths_for_env() -> list[str]:
+    """
+    Git for Windows puts dirname, mkdir, cat, etc. in usr\\bin.
+    Scheduled tasks often omit those; prepend so subprocess bash finds them.
+    """
+    if sys.platform != "win32":
+        return []
+    dirs: list[Path] = []
+    u0 = _bash_git_usr_bin()
+    if u0 is not None:
+        dirs.append(u0)
+    for base in (
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        os.environ.get("LOCALAPPDATA", ""),
+    ):
+        if not base:
+            continue
+        b = Path(base)
+        dirs.extend([b / "Git" / "usr" / "bin", b / "Git" / "bin"])
+    la = os.environ.get("LOCALAPPDATA", "")
+    if la:
+        dirs.append(Path(la) / "Programs" / "Git" / "usr" / "bin")
+    scoop_git = Path.home() / "scoop" / "apps" / "git" / "current" / "usr" / "bin"
+    if scoop_git.is_dir():
+        dirs.append(scoop_git)
+    # Bash we actually invoke — derive usr/bin even when PATH is empty
+    try:
+        bash_p = Path(BASH_BIN).resolve()
+        if bash_p.is_file():
+            for parent in (bash_p.parent, bash_p.parent.parent):
+                cand = parent / "usr" / "bin"
+                if cand.is_dir():
+                    dirs.append(cand)
+                if (parent / "mkdir.exe").is_file() or (parent / "dirname.exe").is_file():
+                    dirs.append(parent)
+    except Exception:
+        pass
+    git_exe = shutil.which("git")
+    if git_exe:
+        p = Path(git_exe).resolve()
+        for parent in (p.parent, p.parent.parent):
+            cand = parent / "usr" / "bin"
+            if cand.is_dir():
+                dirs.append(cand)
+    # `where git` works when PATH is empty but System32 is still on PATH
+    try:
+        wr = subprocess.run(
+            ["where", "git"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if wr.returncode == 0 and wr.stdout:
+            for line in wr.stdout.splitlines():
+                line = line.strip()
+                if not line.lower().endswith("git.exe"):
+                    continue
+                p = Path(line).resolve()
+                for parent in (p.parent, p.parent.parent):
+                    cand = parent / "usr" / "bin"
+                    if cand.is_dir():
+                        dirs.append(cand)
+    except Exception:
+        pass
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        s = str(d.resolve())
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _win_node_paths_for_env() -> list[str]:
+    """node.exe / npm.cmd live here; scheduled tasks often omit them from PATH."""
+    if sys.platform != "win32":
+        return []
+    candidates: list[Path | None] = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "nodejs",
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "nodejs",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "ms" / "nodejs",
+        Path.home() / "AppData" / "Roaming" / "npm",
+    ]
+    node = shutil.which("node")
+    if node:
+        candidates.append(Path(node).resolve().parent)
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in candidates:
+        if d is None:
+            continue
+        try:
+            if d.is_dir():
+                s = str(d.resolve())
+                if s not in seen:
+                    seen.add(s)
+                    out.append(s)
+        except Exception:
+            pass
+    return out
+
+
+# MSYS paths for generated start.sh/stop.sh (best-effort; scripts avoid dirname/mkdir/touch/cat)
+_GIT_BASH_EXPORT_PATH_LINE = (
+    'export PATH="/c/Program Files/Git/usr/bin:/c/Program Files/Git/bin:'
+    '/c/Program Files (x86)/Git/usr/bin:/c/Program Files (x86)/Git/bin:$PATH"'
+)
+
+# No dirname(1): works when PATH is empty (Windows scheduled tasks / minimal Git Bash)
+_BASH_ROOT_DIR_LINES = (
+    '_script="${BASH_SOURCE[0]:-$0}"',
+    '_dir="${_script%/*}"',
+    'if [[ "$_dir" == "$_script" ]] || [[ -z "$_dir" ]]; then',
+    '  _dir="."',
+    "fi",
+    'ROOT_DIR="$(cd "$_dir" && pwd)"',
+)
+
+# .pids / .logs and log stubs — no mkdir(1)/touch(1); PYTHON is set before this line in start.sh
+_MKDIRS_AND_TOUCH_PY = (
+    '"$PYTHON" -c "import pathlib; '
+    "pathlib.Path('.pids').mkdir(parents=True, exist_ok=True); "
+    "pathlib.Path('.logs').mkdir(parents=True, exist_ok=True); "
+    "[pathlib.Path(p).touch() for p in "
+    "('.logs/api.log', '.logs/frontend.log', '.logs/app.log', '.logs/prisma.log')]\"" 
+)
+
+
+def _mkdirs_touch_line_explicit(py_exe: str) -> str:
+    """Same as _MKDIRS_AND_TOUCH_PY but with an absolute interpreter (patching old start.sh)."""
+    return (
+        f'"{py_exe}" -c "import pathlib; '
+        "pathlib.Path('.pids').mkdir(parents=True, exist_ok=True); "
+        "pathlib.Path('.logs').mkdir(parents=True, exist_ok=True); "
+        "[pathlib.Path(p).touch() for p in "
+        "('.logs/api.log', '.logs/frontend.log', '.logs/app.log', '.logs/prisma.log')]" + '"'
+    )
+
+
+def _write_stop_sh_windows_safe(target_dir: Path) -> None:
+    """stop.sh without dirname/cat; kill is a bash builtin."""
+    (target_dir / "stop.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -e\n"
+        "# No dirname/cat — PATH may be empty on Windows scheduled tasks\n"
+        f"{_GIT_BASH_EXPORT_PATH_LINE}\n"
+        + "\n".join(_BASH_ROOT_DIR_LINES)
+        + '\ncd "$ROOT_DIR"\n'
+        'for f in "$ROOT_DIR"/.pids/*.pid; do\n'
+        '  [ -f "$f" ] || continue\n'
+        '  read -r pid < "$f" || true\n'
+        "  pid=\"${pid//$'\\r'/}\"\n"
+        '  [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true; rm -f "$f"\n'
+        "done\necho 'Stopped.'\n"
+    )
+    (target_dir / "stop.sh").chmod(0o755)
+
+
+def _start_sh_needs_windows_fix(txt: str) -> bool:
+    """True if start.sh still relies on dirname/mkdir from PATH (breaks empty-PATH Git Bash)."""
+    if '_script="${BASH_SOURCE[0]:-$0}"' in txt:
+        return False
+    if "pathlib.Path('.pids').mkdir" in txt or "pathlib.path('.pids').mkdir" in txt.lower():
+        return False
+    if (
+        re.search(r"\$\(\s*dirname\s", txt)
+        or re.search(r"dirname\s+[\"']?\$0", txt)
+        or re.search(r"dirname\s+\$\{", txt)
+        or re.search(r"dirname\s+\$0\b", txt)
+    ):
+        return True
+    if re.search(r"^\s*mkdir\s+-p\b", txt, re.MULTILINE) and "pathlib.path('.pids')" not in txt.lower():
+        return True
+    return False
+
+
+def _patch_start_sh_remove_dirname_mkdir(path: Path, py_exe: str) -> bool:
+    """In-place fix for common Claude-generated patterns when heuristics do not match the repo."""
+    try:
+        t = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    orig = t
+    new_root = "\n".join(_BASH_ROOT_DIR_LINES)
+    for pat in (
+        r"^ROOT_DIR\s*=\s*\"\$\(cd\s*\"\$\(dirname\s+\"\$0\"\)\"\s*&&\s*pwd\)\"\s*$",
+        r"^ROOT_DIR\s*=\s*\"\$\(cd\s*\"\$\(dirname\s+\"\$\{BASH_SOURCE\[0\]\}\"\)\"\s*&&\s*pwd\)\"\s*$",
+        r"^ROOT_DIR\s*=\s*\"\$\(cd\s*\"\$\(dirname\s+\$0\)\"\s*&&\s*pwd\)\"\s*$",
+    ):
+        if re.search(pat, t, re.MULTILINE):
+            t = re.sub(pat, new_root, t, count=1, flags=re.MULTILINE)
+            break
+    if t == orig:
+        for old in (
+            'ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"',
+            'ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+        ):
+            if old in t:
+                t = t.replace(old, new_root)
+                break
+    mk = _mkdirs_touch_line_explicit(py_exe)
+    for pat in (r"^\s*mkdir\s+-p\s+\.pids\s+\.logs\s*$", r"^\s*mkdir\s+-p\s+\.pids\s+\.logs\s*\r?$"):
+        if re.search(pat, t, re.MULTILINE):
+            t = re.sub(pat, mk, t, count=1, flags=re.MULTILINE)
+            break
+    for _ in range(4):
+        nt = re.sub(r"^touch\s+[^\n]+\n", "", t, count=1, flags=re.MULTILINE)
+        if nt == t:
+            break
+        t = nt
+    if t == orig:
+        return False
+    path.write_text(t, encoding="utf-8")
+    try:
+        path.chmod(path.stat().st_mode | 0o111)
+    except Exception:
+        pass
+    return True
+
+
+def _maybe_rewrite_start_scripts_for_windows(target_dir: Path) -> bool:
+    """
+    Before running start.sh on Windows: replace scripts that still use dirname/mkdir.
+    Prefer full heuristic regeneration; fall back to regex patch + stop.sh rewrite.
+    """
+    if sys.platform != "win32":
+        return False
+    start = target_dir / "start.sh"
+    if not start.exists():
+        return False
+    try:
+        txt = start.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    if not _start_sh_needs_windows_fix(txt):
+        return False
+    if _heuristic_write_start_scripts(target_dir):
+        return True
+    py_exe = sys.executable.replace(chr(92), "/")
+    if _patch_start_sh_remove_dirname_mkdir(start, py_exe):
+        _write_stop_sh_windows_safe(target_dir)
+        return True
+    return False
+
+
 def _push_log(line: str) -> None:
     """Send a log line to the API. Fire-and-forget."""
     try:
@@ -350,14 +709,23 @@ def get_run_pending_items(session_id: str) -> list[dict]:
     return [i for i in (items or []) if i.get("run_status") in ("starting", "stopping")]
 
 
+_last_ready_tasks_error_log = 0.0
+
+
 def get_ready_tasks() -> list[dict]:
     """Returns all tasks with status=ready (global, no session required)."""
     import urllib.request
+
+    global _last_ready_tasks_error_log
     req = urllib.request.Request(f"{API_BASE}/api/tasks/runner/ready")
     try:
         with urllib.request.urlopen(req, timeout=8) as r:
             return json.loads(r.read())
-    except Exception:
+    except Exception as e:
+        now = time.time()
+        if now - _last_ready_tasks_error_log >= 60:
+            _last_ready_tasks_error_log = now
+            print(f"[runner] get_ready_tasks failed ({API_BASE}/api/tasks/runner/ready): {e}")
         return []
 
 
@@ -606,7 +974,7 @@ def _get_frontend_port(slug: str) -> int | None:
     return entry.get("frontend") or entry.get("api") or None
 
 
-def _kill_pids(target_dir: Path) -> None:
+def _kill_pids(target_dir: Path, *, quiet: bool = False) -> None:
     """Kill all PIDs recorded in target_dir/.pids/"""
     pids_dir = target_dir / ".pids"
     if not pids_dir.exists():
@@ -615,11 +983,124 @@ def _kill_pids(target_dir: Path) -> None:
         try:
             pid = int(pid_file.read_text().strip())
             os.kill(pid, 15)  # SIGTERM
-            print(f"  [run] Sent SIGTERM to PID {pid} ({pid_file.name})")
+            if not quiet:
+                print(f"  [run] Sent SIGTERM to PID {pid} ({pid_file.name})")
         except (ProcessLookupError, ValueError):
             pass
         except Exception as e:
-            print(f"  [run] Could not kill {pid_file.name}: {e}")
+            if not quiet:
+                print(f"  [run] Could not kill {pid_file.name}: {e}")
+
+
+def _run_stop_sh_for_project(target_dir: Path, *, quiet: bool = False) -> None:
+    """Run stop.sh if present, then SIGTERM any PIDs in .pids/ (frees dev server ports)."""
+    stop_script = target_dir / "stop.sh"
+    if stop_script.exists():
+        try:
+            stop_script.chmod(stop_script.stat().st_mode | 0o111)
+            senv = os.environ.copy()
+            if sys.platform == "win32":
+                extra = os.pathsep.join(_win_git_paths_for_env() + _win_node_paths_for_env())
+                if extra:
+                    senv["PATH"] = extra + os.pathsep + senv.get("PATH", "")
+            subprocess.run(
+                [BASH_BIN, "stop.sh"],
+                cwd=str(target_dir),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=senv,
+            )
+        except Exception:
+            pass
+    _kill_pids(target_dir, quiet=quiet)
+
+
+def _port_in_use_error(text: str) -> bool:
+    """True if combined stderr/stdout indicates a TCP listen port conflict."""
+    t = (text or "").lower()
+    if "eaddrinuse" in t:
+        return True
+    if "address already in use" in t:
+        return True
+    if "port is already in use" in t:
+        return True
+    if "only one usage of each socket address" in t:
+        return True
+    return "already in use" in t and ("listen" in t or "bind" in t or "port" in t)
+
+
+def _force_kill_listeners_on_ports_win(port_nums: list[int]) -> None:
+    """Kill processes listening on the given TCP ports (Windows)."""
+    nums = [int(p) for p in port_nums if p and 1 <= int(p) <= 65535]
+    if not nums:
+        return
+    joined = ",".join(str(p) for p in nums)
+    ps = (
+        f"$ports = @({joined}); "
+        "foreach ($p in $ports) { "
+        "$c = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue; "
+        "foreach ($x in @($c)) { "
+        "Stop-Process -Id $x.OwningProcess -Force -ErrorAction SilentlyContinue } }"
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            timeout=45,
+            capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+def _force_kill_listeners_on_ports_unix(port_nums: list[int]) -> None:
+    """Kill processes listening on the given TCP ports (macOS/Linux)."""
+    nums = [int(p) for p in port_nums if p and 1 <= int(p) <= 65535]
+    if not nums:
+        return
+    for p in nums:
+        try:
+            r = subprocess.run(
+                ["lsof", "-t", f"-iTCP:{p}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            if r.returncode != 0 or not (r.stdout or "").strip():
+                continue
+            for pid_s in (r.stdout or "").strip().split():
+                try:
+                    pid = int(pid_s)
+                    if pid > 0:
+                        os.kill(pid, 9)
+                except (ProcessLookupError, ValueError, OSError):
+                    pass
+        except FileNotFoundError:
+            try:
+                subprocess.run(
+                    ["fuser", "-k", f"{p}/tcp"],
+                    capture_output=True,
+                    timeout=8,
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+def _force_kill_listeners_on_registry_ports(ports: dict) -> None:
+    """
+    Opportunity Scraper reserves frontend/api/db per app (9000+ range).
+    If something is still bound, kill listeners so we can start cleanly.
+    """
+    keys = ("frontend", "api", "db")
+    nums = [int(ports[k]) for k in keys if k in ports and ports[k] is not None]
+    if not nums:
+        return
+    if sys.platform == "win32":
+        _force_kill_listeners_on_ports_win(nums)
+    else:
+        _force_kill_listeners_on_ports_unix(nums)
 
 
 NATIVE_SETUP_PROMPT = """You are migrating an existing project to run natively (no Docker).
@@ -645,17 +1126,22 @@ for pg_bin in /opt/homebrew/opt/postgresql@15/bin /opt/homebrew/opt/postgresql@1
   [ -d "$pg_bin" ] && export PATH="$pg_bin:$PATH"
 done
 
-ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Repo root WITHOUT dirname(1) — Windows scheduled tasks often have empty PATH
+_script="${BASH_SOURCE[0]:-$0}"
+_dir="${_script%/*}"
+if [[ "$_dir" == "$_script" ]] || [[ -z "$_dir" ]]; then _dir="."; fi
+ROOT_DIR="$(cd "$_dir" && pwd)"
 ```
 
 start.sh MUST:
 - Set port defaults at the top using the above pattern
 - Also set: PYTHON="${PYTHON:-$(which python3 2>/dev/null || which python)}"
-- mkdir -p .pids .logs
+- Create .pids and .logs using: `"$PYTHON" -c "import pathlib; pathlib.Path('.pids').mkdir(parents=True, exist_ok=True); pathlib.Path('.logs').mkdir(parents=True, exist_ok=True); ..."` (do NOT use mkdir/touch — PATH may lack coreutils on Windows)
 - For Python backends: check for venv Scripts/uvicorn.exe (Windows) or bin/uvicorn (Unix) and create+install if missing; use full venv path
 - For Node (Vite/React): check for node_modules and npm install if missing; pass --port and --host 0.0.0.0
 - For Next.js: use `npm run dev -- -p $FRONTEND_PORT` (Next uses -p not --port)
 - For NestJS: use `PORT=$API_PORT npm run start:dev`
+- For Prisma (backend/prisma/schema.prisma): source `backend/.env` if present, then `export DATABASE_URL="${DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/postgres}"` before `npm run start:dev` (use 5432 for local Postgres; DB_PORT is not the DB server port unless you run Postgres on that port)
 - For PHP or plain HTML: use `php -S 0.0.0.0:$APP_PORT -t ./public` (or ./ if no public/ dir); use $(which php) for portability
 - For PostgreSQL: wait with `pg_isready -d postgres` before starting dependent services
 - Start each process in the background (&), redirect stdout+stderr to .logs/<name>.log
@@ -681,58 +1167,11 @@ Read the project structure first, then write start.sh, stop.sh, and fix any conf
 """
 
 
-def _generate_start_sh(target_dir: Path, slug: str, item_id: str | None = None,
-                       session_id: str | None = None) -> bool:
+def _heuristic_write_start_scripts(target_dir: Path) -> bool:
     """
-    Use Claude to generate native start.sh/stop.sh and fix any hardcoded ports/
-    Docker hostnames in config files. Falls back to heuristic if Claude unavailable.
-    Returns True if start.sh was created.
+    Write start.sh/stop.sh from repo layout (Python, Nest, Next, Vite, etc.).
+    Returns True if a known stack was detected and files were written.
     """
-    print(f"  [run] Running Claude to generate native start scripts for {slug}...")
-    if item_id and session_id:
-        post_log(item_id, session_id, f"🔧 Generating native start scripts for {slug}...")
-
-    try:
-        proc = subprocess.run(
-            _claude_cmd("-p", NATIVE_SETUP_PROMPT, "--dangerously-skip-permissions",
-             "--output-format", "stream-json", "--verbose"),
-            cwd=str(target_dir),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=180,
-        )
-        # Parse stream-json for a result event (best-effort; format varies by CLI version)
-        stream_ok = False
-        for line in proc.stdout.splitlines():
-            try:
-                ev = json.loads(line)
-                if ev.get("type") == "result":
-                    stream_ok = not ev.get("is_error", False)
-            except Exception:
-                pass
-
-        start_path = target_dir / "start.sh"
-        # Trust the filesystem: if start.sh exists, Claude did its job even when
-        # stream-json did not emit a parseable "result" line (or output was wrapped).
-        if start_path.exists():
-            start_path.chmod(0o755)
-            if (target_dir / "stop.sh").exists():
-                (target_dir / "stop.sh").chmod(0o755)
-            print(f"  [run] Claude generated start.sh for {slug}")
-            return True
-
-        err_tail = (proc.stderr or "").strip()
-        if err_tail:
-            print(f"  [run] Claude stderr: {err_tail[:800]}")
-        if proc.returncode != 0:
-            print(f"  [run] Claude exited {proc.returncode}; falling back to heuristic")
-        elif not stream_ok:
-            print(f"  [run] Claude finished without start.sh (stream_ok={stream_ok}); falling back to heuristic")
-        else:
-            print(f"  [run] Claude reported success but start.sh missing; falling back to heuristic")
-    except Exception as e:
-        print(f"  [run] Claude failed ({e}), falling back to heuristic")
-
-    # ── Heuristic fallback ────────────────────────────────────────────────────
     backend_req = target_dir / "backend" / "requirements.txt"
     has_pyproject_backend = (target_dir / "backend" / "pyproject.toml").exists()
     # Prefer frontend/, else first alternate with package.json (Vite apps often use client/ or web/)
@@ -767,6 +1206,7 @@ def _generate_start_sh(target_dir: Path, slug: str, item_id: str | None = None,
 
     def _is_next(pkg: dict)   -> bool: return "next" in pkg.get("dependencies", {}) or "next" in pkg.get("devDependencies", {})
     def _is_nest(pkg: dict)   -> bool: return "@nestjs/core" in pkg.get("dependencies", {})
+    has_nest_cli = has_backend and (target_dir / "backend" / "nest-cli.json").exists()
     def _is_vite(pkg: dict)   -> bool: return "vite" in pkg.get("devDependencies", {}) or "vite" in pkg.get("dependencies", {})
     def _has_dev(pkg: dict)   -> bool: return "dev" in pkg.get("scripts", {})
 
@@ -793,7 +1233,9 @@ def _generate_start_sh(target_dir: Path, slug: str, item_id: str | None = None,
 
     lines = [
         "#!/usr/bin/env bash", "set -e",
-        'ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"',
+        "# Git Bash on Windows: PATH may be empty — no dirname/mkdir/touch (use bash + $PYTHON)",
+        _GIT_BASH_EXPORT_PATH_LINE,
+        *_BASH_ROOT_DIR_LINES,
         'cd "$ROOT_DIR"', "",
         "# Add Homebrew PostgreSQL to PATH (macOS)",
         "for pg_bin in /opt/homebrew/opt/postgresql@15/bin /opt/homebrew/opt/postgresql@16/bin /opt/homebrew/opt/postgresql@17/bin /opt/homebrew/opt/postgresql@18/bin /opt/homebrew/bin /usr/local/opt/postgresql@15/bin; do",
@@ -801,9 +1243,12 @@ def _generate_start_sh(target_dir: Path, slug: str, item_id: str | None = None,
         "done", "",
         "FRONTEND_PORT=${FRONTEND_PORT:-3000}",
         "API_PORT=${API_PORT:-8000}",
+        "DB_PORT=${DB_PORT:-5432}",
         "APP_PORT=${APP_PORT:-5000}",
         f'PYTHON="${{PYTHON:-{py_exe}}}"',
-        "", "mkdir -p .pids .logs", "",
+        "",
+        _MKDIRS_AND_TOUCH_PY,
+        "",
     ]
     generated = False
 
@@ -827,23 +1272,54 @@ def _generate_start_sh(target_dir: Path, slug: str, item_id: str | None = None,
             _pip_install,
             "fi",
             'UVICORN="$ROOT_DIR/backend/venv/Scripts/uvicorn.exe"; [ -f "$UVICORN" ] || UVICORN="$ROOT_DIR/backend/venv/bin/uvicorn"',
+            '(cd "$ROOT_DIR" && npx --yes kill-port@2 "$API_PORT" 2>/dev/null) || true',
             '(cd "$ROOT_DIR/backend" && "$UVICORN" app.main:app --host 0.0.0.0 --port "$API_PORT" > "$ROOT_DIR/.logs/api.log" 2>&1) &',
             'echo $! > "$ROOT_DIR/.pids/api.pid"', "",
         ]
         generated = True
 
     # ── NestJS backend ────────────────────────────────────────────────────────
-    if _is_nest(backend_pkg) and has_backend:
+    has_prisma = (target_dir / "backend" / "prisma" / "schema.prisma").exists()
+    prisma_prep = (
+        [
+            '(cd "$ROOT_DIR/backend" && npx prisma generate >> "$ROOT_DIR/.logs/prisma.log" 2>&1) || true',
+            '(cd "$ROOT_DIR/backend" && npx prisma migrate deploy >> "$ROOT_DIR/.logs/prisma.log" 2>&1) || exit 1',
+            "",
+        ]
+        if has_prisma else []
+    )
+    if (_is_nest(backend_pkg) or has_nest_cli) and has_backend:
+        nest_prisma_env: list[str] = []
+        if has_prisma:
+            nest_prisma_env = [
+                'if [ -f "$ROOT_DIR/backend/.env" ]; then',
+                '  set -a',
+                '  . "$ROOT_DIR/backend/.env"',
+                '  set +a',
+                "fi",
+                'export DATABASE_URL="${DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/postgres}"',
+                "",
+            ]
         lines += [
+            *nest_prisma_env,
             'if [ ! -d "$ROOT_DIR/backend/node_modules" ]; then npm --prefix "$ROOT_DIR/backend" install --silent; fi',
-            '(cd "$ROOT_DIR/backend" && PORT="$API_PORT" npm run start:dev > "$ROOT_DIR/.logs/api.log" 2>&1) &',
+            *prisma_prep,
+            '(cd "$ROOT_DIR" && npx --yes kill-port@2 "$API_PORT" 2>/dev/null) || true',
+            '(cd "$ROOT_DIR/backend" && {',
+            '  echo "[start.sh] Starting Nest PORT=$API_PORT cwd=$(pwd)"',
+            '  PORT="$API_PORT" npm run start:dev',
+            '}) > "$ROOT_DIR/.logs/api.log" 2>&1 &',
             'echo $! > "$ROOT_DIR/.pids/api.pid"', "",
         ]
         generated = True
     elif _is_nest(root_pkg) and not has_frontend:
         lines += [
             'if [ ! -d "$ROOT_DIR/node_modules" ]; then npm install --silent; fi',
-            '(cd "$ROOT_DIR" && PORT="$API_PORT" npm run start:dev > "$ROOT_DIR/.logs/api.log" 2>&1) &',
+            '(cd "$ROOT_DIR" && npx --yes kill-port@2 "$API_PORT" 2>/dev/null) || true',
+            '(cd "$ROOT_DIR" && {',
+            '  echo "[start.sh] Starting Nest PORT=$API_PORT cwd=$(pwd)"',
+            '  PORT="$API_PORT" npm run start:dev',
+            '}) > "$ROOT_DIR/.logs/api.log" 2>&1 &',
             'echo $! > "$ROOT_DIR/.pids/api.pid"', "",
         ]
         generated = True
@@ -864,6 +1340,8 @@ def _generate_start_sh(target_dir: Path, slug: str, item_id: str | None = None,
     # ── Next.js (frontend/subfolder or root) ──────────────────────────────────
     if _is_next(frontend_pkg) and has_frontend:
         lines += [
+            f'printf "NEXT_PUBLIC_API_PORT=%s\\n" "$API_PORT" > "$ROOT_DIR/{frontend_subdir}/.env.local"',
+            '(cd "$ROOT_DIR" && npx --yes kill-port@2 "$FRONTEND_PORT" 2>/dev/null) || true',
             f'if [ ! -d "$ROOT_DIR/{frontend_subdir}/node_modules" ]; then npm --prefix "$ROOT_DIR/{frontend_subdir}" install --silent; fi',
             f'(cd {_fe_dir} && npm run dev -- -p "$FRONTEND_PORT" > "$ROOT_DIR/.logs/frontend.log" 2>&1) &',
             'echo $! > "$ROOT_DIR/.pids/frontend.pid"', "",
@@ -871,6 +1349,8 @@ def _generate_start_sh(target_dir: Path, slug: str, item_id: str | None = None,
         generated = True
     elif _is_next(root_pkg):
         lines += [
+            'printf "NEXT_PUBLIC_API_PORT=%s\\n" "$API_PORT" > "$ROOT_DIR/.env.local"',
+            '(cd "$ROOT_DIR" && npx --yes kill-port@2 "$FRONTEND_PORT" 2>/dev/null) || true',
             'if [ ! -d "$ROOT_DIR/node_modules" ]; then npm install --silent; fi',
             '(cd "$ROOT_DIR" && npm run dev -- -p "$FRONTEND_PORT" > "$ROOT_DIR/.logs/app.log" 2>&1) &',
             'echo $! > "$ROOT_DIR/.pids/app.pid"', "",
@@ -940,16 +1420,63 @@ def _generate_start_sh(target_dir: Path, slug: str, item_id: str | None = None,
     lines += ['echo "Started. Open: http://localhost:${FRONTEND_PORT}"']
     (target_dir / "start.sh").write_text("\n".join(lines) + "\n")
     (target_dir / "start.sh").chmod(0o755)
-    (target_dir / "stop.sh").write_text(
-        "#!/usr/bin/env bash\n"
-        'ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"\n'
-        'for f in "$ROOT_DIR"/.pids/*.pid; do\n'
-        '  [ -f "$f" ] || continue\n'
-        '  kill "$(cat "$f")" 2>/dev/null || true; rm -f "$f"\n'
-        "done\necho 'Stopped.'\n"
-    )
-    (target_dir / "stop.sh").chmod(0o755)
+    _write_stop_sh_windows_safe(target_dir)
     return True
+
+
+def _generate_start_sh(target_dir: Path, slug: str, item_id: str | None = None,
+                       session_id: str | None = None) -> bool:
+    """
+    Prefer layout-based start.sh/stop.sh (instant, no CLI). If the repo is not
+    recognized, try Claude to write scripts and fix Docker-specific config.
+    """
+    if _heuristic_write_start_scripts(target_dir):
+        print(f"  [run] Wrote native start scripts (layout detection) for {slug}")
+        return True
+
+    if item_id and session_id:
+        post_log(item_id, session_id, f"🔧 Generating native start scripts for {slug}...")
+
+    print(f"  [run] Running Claude to generate native start scripts for {slug}...")
+    try:
+        proc = subprocess.run(
+            _claude_cmd("-p", NATIVE_SETUP_PROMPT, "--dangerously-skip-permissions",
+             "--output-format", "stream-json", "--verbose"),
+            cwd=str(target_dir),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=180,
+        )
+        stream_ok = False
+        for line in proc.stdout.splitlines():
+            try:
+                ev = json.loads(line)
+                if ev.get("type") == "result":
+                    stream_ok = not ev.get("is_error", False)
+            except Exception:
+                pass
+
+        start_path = target_dir / "start.sh"
+        if start_path.exists():
+            start_path.chmod(0o755)
+            if (target_dir / "stop.sh").exists():
+                (target_dir / "stop.sh").chmod(0o755)
+            print(f"  [run] Claude generated start.sh for {slug}")
+            return True
+
+        err_tail = (proc.stderr or "").strip()
+        if err_tail:
+            print(f"  [run] Claude stderr: {err_tail[:800]}")
+        if proc.returncode != 0:
+            print(f"  [run] Claude exited {proc.returncode}")
+        elif not stream_ok:
+            print(f"  [run] Claude finished without start.sh (stream_ok={stream_ok})")
+        else:
+            print(f"  [run] Claude reported success but start.sh missing")
+    except Exception as e:
+        print(f"  [run] Claude failed ({e})")
+
+    print(f"  [run] Could not generate start.sh (unrecognized layout; Claude did not write one)")
+    return False
 
 
 def start_project(item: dict, session_id: str) -> None:
@@ -967,46 +1494,92 @@ def start_project(item: dict, session_id: str) -> None:
 
     # Auto-generate start.sh if missing
     if not start_script.exists():
-        print(f"  [run] No start.sh found — running Claude to generate one...")
+        print(f"  [run] No start.sh found — generating one (layout detection, then Claude if needed)...")
         if not _generate_start_sh(target_dir, slug, item_id, session_id):
             print(f"  [run] Could not generate start.sh for {slug}.")
             set_run_result(item_id, session_id, "failed")
             return
+
+    # Windows: rewrite legacy/Claude start.sh that still call dirname/mkdir before first run
+    if _maybe_rewrite_start_scripts_for_windows(target_dir):
+        print("  [run] Refreshed start.sh/stop.sh for Windows (no dirname/mkdir)")
+
+    # Free ports / PIDs from a previous run (avoids EADDRINUSE on Next/Nest dev servers)
+    _run_stop_sh_for_project(target_dir, quiet=True)
 
     try:
         start_script.chmod(start_script.stat().st_mode | 0o111)
 
         # Inject registry-allocated ports as env vars, overriding start.sh defaults
         ports = allocate_project_ports(slug)
+        # Free listeners on this project's ports before start.sh (Nest/Next often run in background
+        # and leave start.sh exiting 0, so EADDRINUSE would not trigger the retry path below).
+        _force_kill_listeners_on_registry_ports(ports)
         env = os.environ.copy()
         env["FRONTEND_PORT"] = str(ports["frontend"])
         env["API_PORT"]      = str(ports["api"])
         env["DB_PORT"]       = str(ports["db"])
         env["APP_PORT"]      = str(ports["frontend"])  # single-process apps
         env["PYTHON"]        = sys.executable           # so start.sh can use $PYTHON instead of python3
+        if (target_dir / "backend" / "prisma" / "schema.prisma").exists():
+            # Default Postgres is on 5432; registry DB_PORT is reserved for optional per-project Postgres.
+            env.setdefault(
+                "DATABASE_URL",
+                "postgresql://postgres:postgres@127.0.0.1:5432/postgres",
+            )
 
-        # On Windows, Git Bash invoked without --login doesn't source /etc/profile,
-        # so basic Unix tools (dirname, mkdir, etc.) are missing from PATH.
-        # Prepend known Git for Windows bin directories unconditionally.
+        # On Windows, Git Bash + Node/npm are often missing from PATH (scheduled tasks).
+        # Do not use bash --login — it can hang sourcing profiles on Windows.
         if sys.platform == "win32":
-            git_unix_paths = [
-                r"C:\Program Files\Git\usr\bin",
-                r"C:\Program Files\Git\bin",
-                r"C:\Program Files (x86)\Git\usr\bin",
-                r"C:\Program Files (x86)\Git\bin",
-            ]
-            extra = os.pathsep.join(p for p in git_unix_paths if Path(p).exists())
+            extra = os.pathsep.join(_win_git_paths_for_env() + _win_node_paths_for_env())
             if extra:
                 env["PATH"] = extra + os.pathsep + env.get("PATH", "")
 
+        start_cmd = _bash_argv_run_start_sh()
         result = subprocess.run(
-            [BASH_BIN, "--login", "start.sh"],
+            start_cmd,
             cwd=str(target_dir),
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=600,
             env=env,
         )
+        err = (result.stderr or "") + (result.stdout or "")
+        low = err.lower()
+        if result.returncode != 0 and (
+            "dirname: command not found" in low
+            or "mkdir: command not found" in low
+        ) and _heuristic_write_start_scripts(target_dir):
+            print("  [run] Regenerated start.sh/stop.sh (no dirname/mkdir); retrying...")
+            start_script.chmod(start_script.stat().st_mode | 0o111)
+            result = subprocess.run(
+                _bash_argv_run_start_sh(),
+                cwd=str(target_dir),
+                capture_output=True, text=True, timeout=600,
+                env=env,
+            )
+
+        err = (result.stderr or "") + (result.stdout or "")
+        if result.returncode != 0 and _port_in_use_error(err):
+            print(
+                "  [run] Registry ports in use — force-killing listeners "
+                f"({ports['frontend']}, {ports['api']}, {ports['db']}) and retrying once..."
+            )
+            _force_kill_listeners_on_registry_ports(ports)
+            _run_stop_sh_for_project(target_dir, quiet=True)
+            result = subprocess.run(
+                start_cmd,
+                cwd=str(target_dir),
+                capture_output=True, text=True, timeout=600,
+                env=env,
+            )
+
         if result.returncode != 0:
-            print(f"  [run] start.sh failed:\n{result.stderr[:400]}")
+            err = (result.stderr or "") + (result.stdout or "")
+            print(f"  [run] start.sh failed:\n{err[:400]}")
+            if "dirname: command not found" in err.lower() or "mkdir: command not found" in err.lower():
+                print(
+                    "  [run] Hint: remove start.sh (and stop.sh) in the project folder, then Start again "
+                    "— or fix PATH so Git usr/bin is visible to bash."
+                )
             set_run_result(item_id, session_id, "failed")
             return
 
@@ -1015,7 +1588,7 @@ def start_project(item: dict, session_id: str) -> None:
         set_run_result(item_id, session_id, "running", run_url)
 
     except subprocess.TimeoutExpired:
-        print("  [run] start.sh timed out")
+        print("  [run] start.sh timed out (10m) — try npm install manually in the project repo")
         set_run_result(item_id, session_id, "failed")
     except Exception as e:
         print(f"  [run] Error: {e}")
@@ -1032,16 +1605,7 @@ def stop_project(item: dict, session_id: str) -> None:
         set_run_result(item_id, session_id, "stopped")
         return
 
-    stop_script = target_dir / "stop.sh"
-    if stop_script.exists():
-        try:
-            stop_script.chmod(stop_script.stat().st_mode | 0o111)
-            subprocess.run([BASH_BIN, "stop.sh"], cwd=str(target_dir),
-                           capture_output=True, text=True, timeout=30)
-        except Exception:
-            pass
-    # Always kill tracked PIDs as safety net
-    _kill_pids(target_dir)
+    _run_stop_sh_for_project(target_dir)
     print(f"  [run] Stopped.")
     set_run_result(item_id, session_id, "stopped")
 
@@ -1335,52 +1899,15 @@ def main():
     while True:
         _send_heartbeat()
         try:
-            # ── Build + run ops (session-based) ──────────────────────────────
-            if _SESSIONS_FILE.exists():
-                session_ids = set(
-                    l.strip() for l in _SESSIONS_FILE.read_text().splitlines() if l.strip()
-                )
-                for session_id in session_ids:
-                    for item in get_building_items(session_id):
-                        if item["id"] not in in_progress:
-                            lock = Path(__file__).parent / f".build_lock_{item['id']}"
-                            if lock.exists():
-                                print(f"[runner] Lock exists for {item['id']}, skipping")
-                                continue
-                            lock.touch()
-                            in_progress.add(item["id"])
-                            print(f"[runner] Picked up build: {item['id']}")
-                            try:
-                                build_item(item, session_id)
-                            finally:
-                                in_progress.discard(item["id"])
-                                lock.unlink(missing_ok=True)
-
-                    for item in get_run_pending_items(session_id):
-                        if item["id"] not in in_progress:
-                            lock = Path(__file__).parent / f".run_lock_{item['id']}"
-                            if lock.exists():
-                                continue
-                            lock.touch()
-                            in_progress.add(item["id"])
-                            print(f"[runner] Picked up run op ({item.get('run_status')}): {item['id']}")
-                            try:
-                                if item.get("run_status") == "starting":
-                                    start_project(item, session_id)
-                                elif item.get("run_status") == "stopping":
-                                    stop_project(item, session_id)
-                            finally:
-                                in_progress.discard(item["id"])
-                                lock.unlink(missing_ok=True)
-
-            # ── Project tasks (global polling) ────────────────────────────────
+            # ── Project tasks FIRST (builder / Claude) ─────────────────────────
+            # Run/build/start ops below can block for minutes (npm, start.sh timeout).
+            # If they ran first, ready tasks would never be polled — agent looked "stuck".
             for task in get_ready_tasks():
                 task_id = task["task_id"]
                 if task_id not in in_progress:
                     lock = Path(__file__).parent / f".task_lock_{task_id}"
-                    if lock.exists():
+                    if not _try_acquire_side_lock(lock):
                         continue
-                    lock.touch()
                     in_progress.add(task_id)
                     try:
                         execute_task(task)
@@ -1400,9 +1927,8 @@ def main():
                         # Resume any paused sibling tasks
                         resume_project_tasks(item_id)
                         lock = Path(__file__).parent / f".task_lock_{task_id}"
-                        if lock.exists():
+                        if not _try_acquire_side_lock(lock):
                             continue
-                        lock.touch()
                         in_progress.add(task_id)
                         try:
                             # Reset to ready so it gets picked up on next poll
@@ -1411,6 +1937,42 @@ def main():
                         finally:
                             in_progress.discard(task_id)
                             lock.unlink(missing_ok=True)
+
+            # ── Build + run ops (session-based) ──────────────────────────────
+            if _SESSIONS_FILE.exists():
+                session_ids = set(
+                    l.strip() for l in _SESSIONS_FILE.read_text().splitlines() if l.strip()
+                )
+                for session_id in session_ids:
+                    for item in get_building_items(session_id):
+                        if item["id"] not in in_progress:
+                            lock = Path(__file__).parent / f".build_lock_{item['id']}"
+                            if not _try_acquire_side_lock(lock):
+                                print(f"[runner] Lock held for build {item['id']}, skipping")
+                                continue
+                            in_progress.add(item["id"])
+                            print(f"[runner] Picked up build: {item['id']}")
+                            try:
+                                build_item(item, session_id)
+                            finally:
+                                in_progress.discard(item["id"])
+                                lock.unlink(missing_ok=True)
+
+                    for item in get_run_pending_items(session_id):
+                        if item["id"] not in in_progress:
+                            lock = Path(__file__).parent / f".run_lock_{item['id']}"
+                            if not _try_acquire_side_lock(lock):
+                                continue
+                            in_progress.add(item["id"])
+                            print(f"[runner] Picked up run op ({item.get('run_status')}): {item['id']}")
+                            try:
+                                if item.get("run_status") == "starting":
+                                    start_project(item, session_id)
+                                elif item.get("run_status") == "stopping":
+                                    stop_project(item, session_id)
+                            finally:
+                                in_progress.discard(item["id"])
+                                lock.unlink(missing_ok=True)
 
         except KeyboardInterrupt:
             print("\nStopped.")
